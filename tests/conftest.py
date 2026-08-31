@@ -5,6 +5,7 @@ ningún archivo del disco ni depender de estado entre tests.
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.models import User
@@ -15,9 +16,16 @@ from app.path_service import get_or_create_root
 def db() -> Session:
     """Sesión de BD contra una SQLite en memoria, con tablas creadas y
     un usuario + directorio raíz ya sembrados, lista para usarse en cada
-    test de forma aislada (se recrea desde cero en cada test)."""
+    test de forma aislada (se recrea desde cero en cada test).
+
+    poolclass=StaticPool es necesario para que la BD en memoria se
+    comparta entre hilos: TestClient ejecuta las peticiones en otro
+    hilo, y sin esto cada hilo vería su propia base vacía.
+    """
     engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine)

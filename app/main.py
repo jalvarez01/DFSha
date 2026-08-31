@@ -68,11 +68,11 @@ def health() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------
-# Routers de mis compañeros: descomentar cuando existan los módulos.
+# Routers de mis compañeros.
 #
 # from app.routers.fs import router as fs_router
-# from app.routers.transfer import router as transfer_router
-#
 # app.include_router(fs_router, prefix="/fs", tags=["fs"])
-# app.include_router(transfer_router, prefix="/files", tags=["transfer"])
 # ---------------------------------------------------------------------
+from app.routers.transfer import router as transfer_router
+
+app.include_router(transfer_router, prefix="/files", tags=["transfer"])
