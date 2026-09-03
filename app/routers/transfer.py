@@ -1,10 +1,6 @@
 """
 Router de transferencia de archivos (RF2): PUT y GET.
 
-Mi parte del contrato fijado en CONTRATOS.md (sección 2). El servidor
-principal (app/models.py, app/database.py) solo guarda METADATOS de
-archivo en la tabla `files`; este módulo es responsable de:
-
 1. Guardar/leer el CONTENIDO real de cada archivo en disco (fuera de la
    base de datos — SQLite no es el lugar para blobs grandes).
 2. Mantener `File.size_bytes` sincronizado con lo realmente almacenado.
