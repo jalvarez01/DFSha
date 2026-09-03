@@ -14,13 +14,20 @@ Todos los endpoints deben:
   `app/path_service.py` (no reimplementar split/normalize a mano).
 - Capturar las excepciones de `path_service` y traducirlas a HTTP así:
 
-| Excepción                        | Código HTTP |
-|-----------------------------------|-------------|
-| `InvalidPathError`                 | 400 |
-| `NotFoundError`                    | 404 |
-| `NotADirectoryError` / `NotAFileError` | 409 |
-| `AlreadyExistsError`               | 409 |
-| `RootOperationError`               | 400 |
+| Excepción                        | Código HTTP | `error` |
+|-----------------------------------|-------------|---------|
+| `InvalidPathError`                 | 400 | `invalid_path` |
+| `NotFoundError`                    | 404 | `not_found` |
+| `NotADirectoryError`               | 409 | `not_a_directory` |
+| `NotAFileError`                    | 409 | `not_a_file` |
+| `AlreadyExistsError`               | 409 | `already_exists` |
+| `RootOperationError`               | 400 | `root_operation` |
+| `DirectoryNotEmptyError` (propia de `fs.py`) | 409 | `directory_not_empty` |
+
+Fuera de esa tabla, la app devuelve además `401 unauthenticated` (falta el
+header `X-Username`, ver `app/deps.py`) y `422 validation_error` (cuerpo de
+request malformado; un manejador en `app/main.py` lo reescribe al formato
+`ErrorResponse` en vez del `detail` en forma de lista que trae FastAPI).
 
 El cuerpo de cualquier error debe tener la forma de `ErrorResponse`
 (`{"error": "...", "message": "..."}"`), típicamente vía:
@@ -40,63 +47,78 @@ por si se quiere soportar `cd` más adelante.
 
 ---
 
-## 1. Compañero de FS: `ls` / `mkdir` / `rmdir` / `rm`
+## 1. RF1 — gestión del FS: `ls` / `mkdir` / `rmdir` / `rm` / `stat`
 
-Archivo sugerido: `app/routers/fs.py`, registrado en `main.py` con
-`prefix="/fs"`.
+**Estado: implementado** en `app/routers/fs.py`, registrado en `main.py`
+con `prefix="/fs"`.
+
+Todos aceptan además el query param opcional `cwd_id: int | None`. Si se
+manda un `cwd_id` inexistente, la respuesta es `404`.
 
 ### `GET /fs/ls`
 
 Lista el contenido de un directorio.
 
-- Query params: `path: str` (default `"/"`), `cwd_id: int | None = None`.
-- Usa `path_service.resolve_directory` + `path_service.list_children`.
-- Respuesta `200`: `ListDirectoryResponse` (`app.schemas`).
-- Errores: `404` si el directorio no existe, `409` si `path` apunta a un
-  archivo.
+- Query params: `path: str` (default `"/"`), `cwd_id`.
+- Respuesta `200`: `ListDirectoryResponse`. Los subdirectorios van antes
+  que los archivos y cada grupo llega ordenado por nombre. Las entradas de
+  tipo `directory` siempre traen `size_bytes: 0`.
+- Errores: `404` si el directorio no existe, `409 not_a_directory` si
+  `path` apunta a un archivo.
 
 ### `POST /fs/mkdir`
 
-Crea un directorio nuevo (no recursivo: el padre debe existir ya).
+Crea un directorio.
 
-- Body: `MkdirRequest` (`{"path": "..."}`).
-- Usa `path_service.resolve_parent_and_name`, luego verifica con
-  `find_child_directory`/`find_child_file` si el nombre ya existe →
-  `AlreadyExistsError` (409) si sí. Si no existe, crea el `Directory` con
-  `owner_id=user.id`.
-- Respuesta `201`: `DirectoryResponse`.
-- Errores: `404` (padre no existe), `409` (ya existe algo con ese nombre),
-  `400` (ruta inválida).
+- Body: `MkdirRequest` (`{"path": "...", "parents": false}`).
+- Con `parents: false` (default) el padre debe existir ya.
+- Con `parents: true` se comporta como `mkdir -p`: crea los directorios
+  intermedios que falten y es idempotente si el destino ya existe.
+- Respuesta `201`: `DirectoryResponse`. Excepción: con `parents: true` y
+  un destino que ya existía, responde `200` (no creó nada).
+- Errores: `404` (el padre no existe), `409 already_exists` (ya hay un
+  archivo o directorio con ese nombre), `409 not_a_directory` (un
+  componente intermedio es un archivo), `400` (ruta inválida o `/`).
 
 ### `DELETE /fs/rmdir`
 
 Borra un directorio.
 
 - Body: `RmdirRequest` (`{"path": "...", "recursive": false}`).
-- Usa `path_service.resolve_directory`. Si `recursive=False` y el
-  directorio tiene hijos (usar `list_children`), responder `409` sin
-  borrar nada. Si `recursive=True`, borrar (el `cascade` del modelo se
-  encarga de los descendientes).
-- No debe permitirse borrar la raíz (`RootOperationError` → 400; en la
-  práctica `resolve_directory("/")` da el root, chequeen
-  `directory.is_root` antes de borrar).
+- Con `recursive: false`, un directorio con contenido responde
+  `409 directory_not_empty` sin borrar nada. Con `recursive: true` se
+  borra el subárbol completo, **incluido el contenido en disco** de los
+  archivos descendientes.
 - Respuesta `200`: `DeleteResponse`.
+- Errores: `400 root_operation` (no se puede borrar `/`), `404`,
+  `409 not_a_directory` (`path` es un archivo → usar `rm`).
 
 ### `DELETE /fs/rm`
 
-Borra un archivo.
+Borra un archivo, tanto sus metadatos como su contenido en disco.
 
 - Body: `RmRequest` (`{"path": "..."}`).
-- Usa `path_service.resolve_file`.
 - Respuesta `200`: `DeleteResponse`.
-- Errores: `404` (no existe), `409` (`path` es un directorio → usar rmdir).
+- Errores: `404` (no existe), `409 not_a_file` (`path` es un directorio →
+  usar `rmdir`).
+
+### `GET /fs/stat`
+
+Metadatos de una entrada cualquiera, sea archivo o directorio. Permite a
+la CLI validar un `cd` sin listar el directorio entero.
+
+- Query params: `path: str` (default `"/"`), `cwd_id`.
+- Respuesta `200`: `StatResponse`. Para directorios, `size_bytes` es `0` y
+  `updated_at` es `null`; la raíz se reporta con `name: "/"`.
+- Errores: `404` (no existe), `409 not_a_directory` (un componente
+  intermedio es un archivo), `400` (ruta inválida).
 
 ---
 
-## 2. Compañero de transferencia: `put` / `get`
+## 2. RF2 — transferencia: `put` / `get`
 
-Archivo sugerido: `app/routers/transfer.py`, registrado en `main.py` con
-`prefix="/files"`.
+**Estado: implementado** en `app/routers/transfer.py`, registrado en
+`main.py` con `prefix="/files"`.
 
 Este servidor (mi parte) solo guarda **metadatos** de archivo en la tabla
 `files` (nombre, tamaño, dueño, ubicación). El almacenamiento del
@@ -131,10 +153,15 @@ Descarga un archivo.
 
 - Usa `path_service.resolve_file(db, path)` para obtener metadatos y
   ubicar el contenido almacenado.
-- Respuesta: `StreamingResponse`/`FileResponse` con el contenido, o un
-  endpoint separado `GET /files/{path:path}/meta` que devuelva
-  `FileMetadata` si prefieren separar metadata de contenido.
+- Respuesta: `StreamingResponse` con el contenido y los headers
+  `Content-Length` y `X-Checksum-Sha256`.
 - Errores: `404` (no existe), `409` (`path` es un directorio).
+
+### `HEAD /files/{path:path}`
+
+Igual que el `GET` pero sin cuerpo: devuelve solo los headers
+`Content-Length` y `X-Checksum-Sha256`, para conocer tamaño y checksum sin
+descargar. Para los metadatos completos en JSON, usar `GET /fs/stat`.
 
 ---
 

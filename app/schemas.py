@@ -63,6 +63,13 @@ class MkdirRequest(BaseModel):
     """Cuerpo de POST /fs/mkdir."""
 
     path: str = Field(description="Ruta absoluta o relativa al cwd del directorio a crear")
+    parents: bool = Field(
+        default=False,
+        description=(
+            "Equivalente a 'mkdir -p': crea los directorios intermedios que falten y no "
+            "falla si el destino ya existe. Con False, el padre debe existir ya"
+        ),
+    )
 
 
 class DirectoryResponse(BaseModel):
@@ -96,6 +103,22 @@ class DeleteResponse(BaseModel):
 
     path: str
     deleted: bool = True
+
+
+class StatResponse(BaseModel):
+    """Respuesta de GET /fs/stat: metadatos de una entrada cualquiera del
+    árbol, sea archivo o directorio. Es lo que permite a la CLI validar un
+    `cd` sin tener que listar el directorio entero."""
+
+    path: str = Field(description="Ruta absoluta normalizada")
+    name: str
+    type: EntryType
+    size_bytes: int = Field(description="0 para directorios")
+    owner: str = Field(description="username del dueño")
+    created_at: datetime
+    updated_at: datetime | None = Field(
+        default=None, description="None para directorios (no registran modificación)"
+    )
 
 
 # --------------------------------------------------------------------------

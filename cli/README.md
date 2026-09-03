@@ -24,15 +24,18 @@ dfsha whoami
 dfsha pwd
 
 dfsha mkdir /docs
+dfsha mkdir -p /docs/2026/informes    # crea los intermedios que falten
 dfsha cd /docs
 dfsha ls .
 
 dfsha put informe.pdf informe.pdf     # sube ./informe.pdf a /docs/informe.pdf
 dfsha get informe.pdf copia.pdf       # descarga /docs/informe.pdf a ./copia.pdf
+dfsha stat informe.pdf                # tamaño, dueño y fechas, sin descargar
 
 dfsha rm informe.pdf
 dfsha cd ..
 dfsha rmdir docs
+dfsha rmdir -r docs                   # con su contenido
 
 dfsha logout
 ```
@@ -51,14 +54,13 @@ el código final de cada compañero, así que hoy (Hito 1 en progreso):
 |------------------------------|---------------------|---------------------------|
 | `login`, `logout`, `whoami`, `pwd` | Solo cliente        | ✅ funcionando |
 | `put`, `get`                  | `/files/*` (Paulina) | ✅ probado end-to-end (subida, descarga, checksum, sobreescritura) |
-| `ls`, `mkdir`, `rmdir`, `rm`, `cd` (validación) | `/fs/*` (Jacobo) | ⏳ el router aún no está registrado en `app/main.py`. La CLI ya está lista: en cuanto Jacobo suba su parte y se agregue `app.include_router(fs_router, prefix="/fs", ...)` en `main.py`, estos comandos deberían funcionar sin tocar nada de este módulo. |
+| `ls`, `mkdir`, `rmdir`, `rm`, `stat`, `cd` (validación) | `/fs/*` (Jacobo) | ✅ probado end-to-end contra el router `/fs` ya registrado en `app/main.py` |
 
-Mientras tanto, la CLI no explota con un traceback feo: si un endpoint de
-`/fs/*` no existe todavía, se muestra un mensaje explícito
-("endpoint aún no implementado en el servidor") en vez de un error
-genérico, y `cd` sigue funcionando en modo degradado (solo actualiza el
-directorio de trabajo local, sin poder validar contra el servidor que
-la ruta exista).
+La detección de endpoints no registrados sigue en su sitio por si en el
+futuro se agregan rutas nuevas: si un `/fs/*` no existiera, la CLI muestra
+un mensaje explícito ("endpoint aún no implementado en el servidor") en vez
+de un error genérico, y `cd` degrada a actualizar solo el directorio de
+trabajo local.
 
 ## Decisiones de diseño (por si preguntan en la sustentación)
 
@@ -74,7 +76,9 @@ la ruta exista).
   absolutas y no usar `cwd_id`. Por eso el "directorio de trabajo" se
   guarda en la sesión local (`~/.dfsha/session.json`) y toda ruta
   relativa que el usuario escriba se resuelve a absoluta *antes* de
-  llamar a la API (ver `pathutils.py`).
+  llamar a la API (ver `pathutils.py`). Lo único que sí se consulta al
+  servidor es que el destino exista y sea un directorio, vía
+  `GET /fs/stat`.
 - **`put`/`get` en streaming**: nunca se carga el archivo completo en
   memoria (ni al subir ni al bajar), acorde con `RNF1` (escalabilidad en
   tamaño de archivo) y con cómo Paulina implementó el servidor
@@ -90,7 +94,7 @@ pytest -q
 ```
 
 Cubren la resolución de rutas (`pathutils.py`), que es la lógica propia
-de este módulo que no depende de tener el servidor corriendo. El resto
-(`put`/`get`/`login`) se probó manualmente end-to-end contra un server
-local (ver tabla de arriba); no se incluyen tests de integración contra
-`/fs/*` porque ese endpoint aún no existe en el servidor.
+de este módulo que no depende de tener el servidor corriendo. El resto de
+los comandos se probó manualmente end-to-end contra un server local (ver
+tabla de arriba); los endpoints que consumen tienen su propia suite en
+`tests/test_fs.py` y `tests/test_transfer.py` del repo del servidor.

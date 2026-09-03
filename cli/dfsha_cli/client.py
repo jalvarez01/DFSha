@@ -130,8 +130,13 @@ class DFShaClient:
         resp = self._request("GET", "/fs/ls", params={"path": path})
         return resp.json()
 
-    def mkdir(self, path: str) -> dict:
-        resp = self._request("POST", "/fs/mkdir", json={"path": path})
+    def mkdir(self, path: str, parents: bool = False) -> dict:
+        resp = self._request("POST", "/fs/mkdir", json={"path": path, "parents": parents})
+        return resp.json()
+
+    def stat(self, path: str) -> dict:
+        """Metadatos de una entrada (archivo o directorio), sin descargarla."""
+        resp = self._request("GET", "/fs/stat", params={"path": path})
         return resp.json()
 
     def rmdir(self, path: str, recursive: bool = False) -> dict:

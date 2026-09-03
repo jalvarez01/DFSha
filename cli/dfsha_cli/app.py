@@ -8,7 +8,8 @@ Comandos implementados (según el reparto de tareas del equipo):
     dfsha pwd                   Muestra el directorio de trabajo actual
     dfsha ls [ruta]              Lista un directorio          (RF1)
     dfsha cd <ruta>              Cambia el directorio de trabajo (RF1, cliente)
-    dfsha mkdir <ruta>           Crea un directorio            (RF1)
+    dfsha stat [ruta]            Metadatos de un archivo/directorio (RF1)
+    dfsha mkdir <ruta> [-p]      Crea un directorio            (RF1)
     dfsha rmdir <ruta> [-r]      Borra un directorio           (RF1)
     dfsha rm <ruta>              Borra un archivo               (RF1)
     dfsha put <local> [remota]  Sube un archivo                (RF2)
@@ -165,25 +166,31 @@ def ls(path: str = typer.Argument(".", help="Ruta a listar (absoluta o relativa 
 def cd(path: str = typer.Argument(..., help="Ruta a la que moverse (absoluta o relativa)")):
     """Cambia el directorio de trabajo actual (estado guardado en el cliente).
 
-    Intenta validar contra el servidor que la ruta exista y sea un
-    directorio; si el endpoint /fs/ls todavía no está disponible, avisa
-    pero igual actualiza el cwd local (para no bloquear a quien esté
-    probando el resto de la CLI mientras ese endpoint no exista).
+    Valida contra el servidor que la ruta exista y sea un directorio; si el
+    endpoint /fs/stat todavía no está disponible, avisa pero igual actualiza
+    el cwd local (para no bloquear a quien esté probando el resto de la CLI
+    mientras ese endpoint no exista).
     """
     session = auth.load_session()
     target = pathutils.resolve_path(session.cwd, path)
 
     client = DFShaClient(session)
     try:
-        client.ls(target)
+        entry = client.stat(target)
     except RouteNotImplemented:
         console.print(
             "[yellow]![/yellow] No se pudo validar contra el servidor "
-            "(endpoint /fs/ls aún no implementado); cwd actualizado solo localmente."
+            "(endpoint /fs/stat aún no implementado); cwd actualizado solo localmente."
         )
     except APIError as exc:
         err_console.print(f"✗ No se pudo cambiar a {target}: {exc}")
         raise typer.Exit(code=1)
+    else:
+        # stat resuelve archivos y directorios por igual, así que el tipo hay
+        # que comprobarlo aquí: 'cd archivo.txt' no debe cambiar el cwd.
+        if entry.get("type") != "directory":
+            err_console.print(f"✗ No se pudo cambiar a {target}: no es un directorio")
+            raise typer.Exit(code=1)
 
     session.cwd = target
     auth.save_session(session)
@@ -192,11 +199,40 @@ def cd(path: str = typer.Argument(..., help="Ruta a la que moverse (absoluta o r
 
 @app.command()
 @_handle_errors
-def mkdir(path: str = typer.Argument(..., help="Ruta del directorio a crear")):
-    """Crea un directorio remoto (el padre debe existir)."""
+def stat(path: str = typer.Argument(".", help="Ruta a consultar (archivo o directorio)")):
+    """Muestra los metadatos de un archivo o directorio remoto."""
     client, session = _load_client_and_session()
     target = _resolve(session, path)
-    data = client.mkdir(target)
+    data = client.stat(target)
+
+    table = Table(title=data["path"])
+    table.add_column("Campo")
+    table.add_column("Valor")
+    table.add_row("tipo", "dir" if data["type"] == "directory" else "file")
+    table.add_row("nombre", data["name"])
+    table.add_row("tamaño", "-" if data["type"] == "directory" else f"{data['size_bytes']} bytes")
+    table.add_row("dueño", data["owner"])
+    table.add_row("creado", str(data["created_at"]))
+    if data.get("updated_at"):
+        table.add_row("modificado", str(data["updated_at"]))
+    console.print(table)
+
+
+@app.command()
+@_handle_errors
+def mkdir(
+    path: str = typer.Argument(..., help="Ruta del directorio a crear"),
+    parents: bool = typer.Option(
+        False,
+        "--parents",
+        "-p",
+        help="Crear los directorios intermedios que falten y no fallar si ya existe",
+    ),
+):
+    """Crea un directorio remoto (sin -p, el padre debe existir)."""
+    client, session = _load_client_and_session()
+    target = _resolve(session, path)
+    data = client.mkdir(target, parents=parents)
     console.print(f"[green]✓[/green] Directorio creado: {data['path']}")
 
 
