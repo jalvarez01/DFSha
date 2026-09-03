@@ -1,6 +1,7 @@
 """
 Router de transferencia de archivos (RF2): PUT y GET.
 
+
 1. Guardar/leer el CONTENIDO real de cada archivo en disco (fuera de la
    base de datos — SQLite no es el lugar para blobs grandes).
 2. Mantener `File.size_bytes` sincronizado con lo realmente almacenado.
@@ -104,18 +105,12 @@ def _read_checksum(file_id: int) -> str | None:
 
 
 def _as_absolute(path: str) -> str:
-    """FastAPI captura `{path:path}` SIN el '/' inicial (p. ej. la URL
-    `/files/report.txt` entrega `path == "report.txt"`, no "/report.txt").
-    Según CONTRATOS.md, la CLI siempre manda rutas absolutas, así que acá
-    se restituye el '/' inicial para que path_service la trate como tal
-    (si no, la interpretaría como relativa y exigiría cwd_id)."""
+   
     return path if path.startswith("/") else f"/{path}"
 
 
 def _join_path(parent_path: str, leaf: str) -> str:
-    """Reconstruye la ruta absoluta de un hijo a partir de la ruta
-    absoluta de su padre (evita depender de la ruta cruda que mandó el
-    cliente, que puede venir relativa o con '.'/'..')."""
+   
     if parent_path == "/":
         return f"/{leaf}"
     return f"{parent_path}/{leaf}"
@@ -142,13 +137,7 @@ async def put_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> PutFileResponse:
-    """Sube (crea o sobreescribe) un archivo.
-
-    El contenido va en el body crudo de la request (no multipart): el
-    cliente hace un PUT con el archivo como body, tal como en S3 o WebDAV.
-    Se recibe y escribe en streaming, calculando el checksum SHA-256 al
-    vuelo, sin cargar el archivo completo en memoria.
-    """
+    
     path = _as_absolute(path)
     try:
         resolved = resolve_parent_and_name(db, path, cwd_id)
@@ -261,9 +250,7 @@ def head_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    """Metadata de un archivo sin traer el contenido (útil para que el
-    cliente conozca tamaño y checksum antes de decidir descargar, o para
-    verificar si un archivo remoto ya está actualizado)."""
+    
     path = _as_absolute(path)
     try:
         file_row = resolve_file(db, path, cwd_id)
