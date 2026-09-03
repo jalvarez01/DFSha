@@ -12,7 +12,7 @@ El Hito 1 está completo: **servidor core y modelo de datos** (Juan),
 transferencia de archivos** (Paulina) y la **CLI** (Mariana). Las firmas
 exactas de cada endpoint están en [`CONTRATOS.md`](./CONTRATOS.md).
 
-Queda fuera del Hito 1 (por cronograma): la arquitectura distribuida
+Queda fuera del Hito 1: la arquitectura distribuida
 (Hito 2) y la alta disponibilidad, replicación y seguridad real —
 autenticación con contraseña y control de acceso por usuario — (Hito 3).
 Hoy el header `X-Username` identifica al dueño de cada operación pero no
