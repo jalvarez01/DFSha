@@ -22,6 +22,26 @@ class Settings(BaseSettings):
     # de ruta), para evitar nombres absurdamente largos.
     max_name_length: int = 255
 
+    # Firma de los JWT que emite POST /auth/login. El valor por defecto es
+    # SOLO para desarrollo: en cualquier despliegue real hay que fijar la
+    # variable de entorno DFSHA_JWT_SECRET.
+    jwt_secret: str = "dev-secret-cambiar-en-produccion"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 12
+
+    # --- Hito 2: DFS distribuido por bloques (ControlNode) ---
+    # Tamaño de bloque por defecto para particionar archivos. El cliente
+    # puede pedir otro en /allocate, pero si no lo especifica se usa este.
+    # 8 MiB es el mismo orden de magnitud que HDFS (64/128 MiB) ajustado a
+    # un clúster de laboratorio.
+    block_size_bytes: int = 8 * 1024 * 1024
+
+    # Ventana de gracia para considerar "vivo" a un DataNode: si su último
+    # heartbeat es más antiguo que esto, se excluye del reparto de bloques.
+    # Debe ser holgadamente mayor que el intervalo con que los DataNodes
+    # mandan heartbeat (p. ej. heartbeat cada 10 s, TTL de 30 s).
+    heartbeat_ttl_seconds: int = 30
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="DFSHA_")
 
 

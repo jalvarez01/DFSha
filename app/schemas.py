@@ -152,3 +152,168 @@ class UserResponse(BaseModel):
     id: int
     username: str
     created_at: datetime
+
+
+# --------------------------------------------------------------------------
+# Contrato: autenticación (POST /auth/login)
+# --------------------------------------------------------------------------
+class LoginRequest(BaseModel):
+    """Credenciales de inicio de sesión."""
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class TokenResponse(BaseModel):
+    """JWT emitido tras un login correcto. El cliente lo manda de vuelta en
+    cada petición como `Authorization: Bearer <access_token>`."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Segundos de validez del token")
+    username: str
+
+
+# ==========================================================================
+# Contrato Hito 2 — ControlNode (DFS distribuido por bloques)
+# ==========================================================================
+# Estos modelos fijan la forma exacta de los cuerpos que intercambian:
+#   - DataNode  <-> ControlNode : register / heartbeat
+#   - Cliente   <-> ControlNode : allocate (plan de escritura) / confirm /
+#                                 blocks (plan de lectura)
+# El cliente (Paulina/Mariana) usa DataNodeLocation para saber a qué
+# host:puerto subir/bajar cada bloque, sin que el ControlNode toque datos.
+
+
+class DataNodeStatus(str, Enum):
+    """Último estado reportado por un DataNode."""
+
+    ALIVE = "alive"
+    DEAD = "dead"
+
+
+# --- DataNode <-> ControlNode ---------------------------------------------
+class DataNodeRegisterRequest(BaseModel):
+    """Cuerpo de POST /datanodes/register. Lo manda el DataNode al arrancar."""
+
+    node_id: str = Field(min_length=1, max_length=128, description="Id estable elegido por el DataNode")
+    host: str = Field(min_length=1, max_length=255, description="Host/IP alcanzable por el cliente")
+    port: int = Field(ge=1, le=65535)
+
+
+class HeartbeatRequest(BaseModel):
+    """Cuerpo de POST /datanodes/heartbeat."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+
+
+class DataNodeInfo(BaseModel):
+    """Vista completa de un DataNode (respuesta de register y de GET
+    /datanodes). `status` refleja la liveness *calculada* al momento de la
+    consulta, no solo el último valor persistido."""
+
+    node_id: str
+    host: str
+    port: int
+    status: DataNodeStatus
+    last_heartbeat: datetime | None
+    registered_at: datetime
+
+
+class HeartbeatResponse(BaseModel):
+    """Respuesta de POST /datanodes/heartbeat: acuse con el estado guardado."""
+
+    node_id: str
+    status: DataNodeStatus
+    last_heartbeat: datetime
+
+
+class DataNodeLocation(BaseModel):
+    """Dónde vive un bloque: lo mínimo que el cliente necesita para hablar
+    con el DataNode (PUT/GET /blocks/{block_id})."""
+
+    node_id: str
+    host: str
+    port: int
+
+
+# --- Cliente <-> ControlNode: plan de escritura (allocate + confirm) ------
+class AllocateRequest(BaseModel):
+    """Cuerpo de POST /files/{path}/allocate. El cliente ya conoce el tamaño
+    total del archivo (lo tiene en disco) antes de subir nada."""
+
+    size_bytes: int = Field(ge=0, description="Tamaño total del archivo a subir")
+    block_size: int | None = Field(
+        default=None,
+        ge=1,
+        description="Tamaño de bloque deseado; si es None se usa settings.block_size_bytes",
+    )
+
+
+class AllocatedBlock(BaseModel):
+    """Una entrada del plan de escritura: dónde subir un bloque concreto."""
+
+    index: int = Field(description="Orden del bloque dentro del archivo (0-based)")
+    block_id: str = Field(description="Id opaco con el que subir el bloque al DataNode")
+    size_bytes: int = Field(description="Bytes que debe tener este bloque")
+    datanode: DataNodeLocation
+
+
+class AllocateResponse(BaseModel):
+    """Respuesta de POST /files/{path}/allocate: el plan de escritura
+    completo. El cliente sube cada bloque a su DataNode y luego llama a
+    /confirm."""
+
+    path: str = Field(description="Ruta absoluta normalizada del archivo")
+    file_id: int
+    block_size: int = Field(description="Tamaño de bloque efectivamente usado")
+    total_size: int
+    blocks: list[AllocatedBlock]
+
+
+class ConfirmBlock(BaseModel):
+    """Confirmación de un bloque ya subido: su checksum y tamaño reales."""
+
+    block_id: str
+    checksum: str = Field(min_length=1, max_length=64, description="SHA-256 hex del bloque subido")
+    size_bytes: int = Field(ge=0)
+
+
+class ConfirmRequest(BaseModel):
+    """Cuerpo de POST /files/{path}/confirm: los bloques que se subieron OK."""
+
+    blocks: list[ConfirmBlock]
+
+
+class ConfirmResponse(BaseModel):
+    """Respuesta de POST /files/{path}/confirm."""
+
+    path: str
+    file_id: int
+    size_bytes: int = Field(description="Tamaño total consolidado (suma de bloques confirmados)")
+    num_blocks: int = Field(description="Bloques confirmados")
+    complete: bool = Field(description="True si todos los bloques planificados quedaron confirmados")
+
+
+# --- Cliente <-> ControlNode: plan de lectura -----------------------------
+class BlockPlacement(BaseModel):
+    """Una entrada del plan de lectura: de dónde bajar un bloque y con qué
+    checksum verificarlo."""
+
+    index: int
+    block_id: str
+    size_bytes: int
+    checksum: str | None = Field(description="SHA-256 hex esperado del bloque")
+    datanode: DataNodeLocation
+
+
+class BlocksResponse(BaseModel):
+    """Respuesta de GET /files/{path}/blocks: el plan de lectura ordenado.
+    El cliente descarga cada bloque de su DataNode, verifica el checksum y
+    reensambla en orden de `index`."""
+
+    path: str
+    file_id: int
+    size_bytes: int
+    num_blocks: int
+    blocks: list[BlockPlacement]

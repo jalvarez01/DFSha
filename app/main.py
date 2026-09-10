@@ -95,9 +95,22 @@ def health() -> dict[str, str]:
 # ---------------------------------------------------------------------
 # Routers de negocio. Las rutas de /fs son estáticas, así que no compiten
 # con el catch-all /files/{path:path} y el orden de registro es indiferente.
+#
+# OJO con /files: el router de control (Hito 2) expone rutas con sufijo de
+# acción sobre el mismo prefijo — /files/{path}/allocate|/confirm|/blocks —
+# y el de transferencia reclama el catch-all /files/{path:path}. El de
+# control DEBE registrarse ANTES para que, p. ej., `GET /files/a/blocks`
+# resuelva al plan de lectura y no a "descargar el archivo /a/blocks".
+# Ver el docstring de app/routers/control.py.
 # ---------------------------------------------------------------------
+from app.routers.auth import router as auth_router
+from app.routers.control import router as control_router
+from app.routers.datanodes import router as datanodes_router
 from app.routers.fs import router as fs_router
 from app.routers.transfer import router as transfer_router
 
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(fs_router, prefix="/fs", tags=["fs"])
+app.include_router(datanodes_router, prefix="/datanodes", tags=["datanodes"])
+app.include_router(control_router, prefix="/files", tags=["control"])
 app.include_router(transfer_router, prefix="/files", tags=["transfer"])

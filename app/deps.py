@@ -2,15 +2,18 @@
 Dependencias de FastAPI compartidas (además de `get_db`, que vive en
 app/database.py por estar ligada al engine).
 
-En el Hito 1 no hay autenticación real todavía. Para que mis compañeros
-puedan implementar sus endpoints ya (necesitan un owner_id para crear
-archivos/directorios) sin bloquearse esperando el sistema de login,
-`get_current_user` resuelve el usuario a partir de un header simple
-`X-Username`, creándolo si es la primera vez que se ve ese nombre.
+`get_current_user` resuelve el usuario dueño de cada operación y acepta
+dos formas de identificarse, en este orden:
 
-Cuando se implemente autenticación de verdad, esta función es el único
-lugar que hay que reemplazar: todos los endpoints que dependen de
-`get_current_user` seguirán funcionando igual.
+1. `Authorization: Bearer <jwt>` — el camino real. El token lo emite
+   POST /auth/login tras verificar usuario/contraseña (ver
+   app/routers/auth.py). Se valida firma y expiración, y el usuario debe
+   existir en la BD.
+2. `X-Username: <nombre>` — camino heredado del inicio del Hito 1, cuando
+   todavía no había login. NO verifica nada: autocrea el usuario si no
+   existe. Se mantiene porque es lo que usan los tests y scripts de los
+   demás módulos, y desaparece en el Hito 3 junto con el control de acceso
+   real. No debe usarse fuera de desarrollo.
 """
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
@@ -18,23 +21,55 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User
+from app.security import InvalidTokenError, decode_access_token
+
+_UNAUTHENTICATED = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail={
+        "error": "unauthenticated",
+        "message": "Falta autenticación: manda 'Authorization: Bearer <token>' (POST /auth/login)",
+    },
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+
+def _invalid_token(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"error": "invalid_token", "message": message},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _user_from_token(db: Session, authorization: str) -> User:
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise _invalid_token("El header Authorization debe ser 'Bearer <token>'")
+
+    try:
+        payload = decode_access_token(token.strip())
+    except InvalidTokenError as exc:
+        raise _invalid_token(f"Token inválido o expirado: {exc}") from exc
+
+    user = db.get(User, payload.get("uid"))
+    if user is None or user.username != payload.get("sub"):
+        # El token es válido pero el usuario ya no existe (o le cambiaron el
+        # nombre): no se puede seguir operando con él.
+        raise _invalid_token("El usuario del token ya no existe")
+    return user
 
 
 def get_current_user(
+    authorization: str | None = Header(default=None, alias="Authorization"),
     x_username: str | None = Header(default=None, alias="X-Username"),
     db: Session = Depends(get_db),
 ) -> User:
-    """Resuelve el usuario "actual" a partir del header `X-Username`.
+    """Resuelve el usuario "actual" de la petición (ver docstring del módulo)."""
+    if authorization:
+        return _user_from_token(db, authorization)
 
-    Placeholder deliberado para el Hito 1 (sin login real). Si el header
-    no viene, responde 401 para dejar claro que todo endpoint protegido
-    necesita identificarse de alguna forma, aunque sea así de simple.
-    """
     if not x_username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "unauthenticated", "message": "Falta el header X-Username"},
-        )
+        raise _UNAUTHENTICATED
 
     user = db.scalar(select(User).where(User.username == x_username))
     if user is None:

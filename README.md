@@ -12,11 +12,15 @@ El Hito 1 está completo: **servidor core y modelo de datos** (Juan),
 transferencia de archivos** (Paulina) y la **CLI** (Mariana). Las firmas
 exactas de cada endpoint están en [`CONTRATOS.md`](./CONTRATOS.md).
 
-Queda fuera del Hito 1: la arquitectura distribuida
-(Hito 2) y la alta disponibilidad, replicación y seguridad real —
-autenticación con contraseña y control de acceso por usuario — (Hito 3).
-Hoy el header `X-Username` identifica al dueño de cada operación pero no
-restringe nada: el namespace es global.
+La autenticación básica user/pass con JWT que pide el enunciado ya está:
+`POST /auth/login` verifica credenciales y emite un token que todo
+endpoint exige como `Authorization: Bearer <jwt>`.
+
+Queda fuera del Hito 1: la arquitectura distribuida (Hito 2) y la alta
+disponibilidad, replicación y seguridad avanzada (Hito 3). En particular,
+el **control de acceso por usuario** es del Hito 3: hoy el token dice
+quién hace cada operación y quién es el dueño de cada archivo, pero el
+namespace sigue siendo global y no restringe nada.
 
 ## Estructura del repo
 
@@ -37,6 +41,7 @@ DFSha/
 ├── tests/
 │   ├── conftest.py
 │   ├── test_path_service.py
+│   ├── test_auth.py       # Tests de login/JWT
 │   ├── test_fs.py         # Tests de RF1
 │   └── test_transfer.py   # Tests de RF2
 ├── requirements.txt
@@ -55,6 +60,13 @@ uvicorn app.main:app --reload
 # -> http://localhost:8000/health
 ```
 
+En cualquier despliegue que no sea desarrollo local hay que fijar el
+secreto con el que se firman los JWT:
+
+```bash
+export DFSHA_JWT_SECRET="algo-largo-y-aleatorio"
+```
+
 ## Tests
 
 ```bash
@@ -66,6 +78,35 @@ La suite de la CLI vive aparte y necesita su propio instalable:
 ```bash
 pip install -e ./cli && pytest cli/tests -q
 ```
+
+## Autenticación (`app/routers/auth.py`, `app/security.py`)
+
+`POST /auth/login` recibe `{"username", "password"}` y devuelve un JWT
+(HS256, 12 h por defecto) que hay que mandar en toda petición posterior
+como `Authorization: Bearer <token>`.
+
+- Las contraseñas se guardan hasheadas con PBKDF2-HMAC-SHA256 y salt
+  aleatorio en `users.password_hash` (librería estándar, sin dependencias
+  nativas que compilar).
+- No hay endpoint de registro porque el enunciado solo pide autenticación
+  básica: el primer login de un usuario sin contraseña fija la que envíe,
+  y los siguientes la verifican (`401 invalid_credentials` si no cuadra).
+- El header `X-Username` se sigue aceptando como fallback de desarrollo
+  —no verifica nada—; si vienen los dos, gana el token.
+
+```bash
+# Obtener un token
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"mariana","password":"clave123"}' | jq -r .access_token)
+
+# Usarlo
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/fs/ls?path=/"
+```
+
+Desde la CLI es transparente: `dfsha login <usuario>` pide la contraseña,
+guarda el token en `~/.dfsha/session.json` (permisos 600) y el resto de
+comandos lo usan solos.
 
 ## RF1 — Gestión del sistema de archivos (`app/routers/fs.py`)
 
@@ -86,25 +127,25 @@ el contrato de la sección 1 de [`CONTRATOS.md`](./CONTRATOS.md).
 - `stat` sirve tanto para archivos como para directorios; es lo que usa
   la CLI para validar un `cd` sin listar el directorio entero.
 
-### Ejemplos (con el servidor corriendo en `localhost:8000`)
+### Ejemplos (con el servidor corriendo en `localhost:8000` y `$TOKEN` del login)
 
 ```bash
 # Crear un árbol de directorios de una vez
-curl -X POST -H "X-Username: jacobo" -H "Content-Type: application/json" \
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"path":"/docs/informes","parents":true}' http://localhost:8000/fs/mkdir
 
 # Listar
-curl -H "X-Username: jacobo" "http://localhost:8000/fs/ls?path=/docs"
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/fs/ls?path=/docs"
 
 # Metadatos de una entrada cualquiera
-curl -H "X-Username: jacobo" "http://localhost:8000/fs/stat?path=/docs/informes"
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/fs/stat?path=/docs/informes"
 
 # Borrar un archivo (metadatos + contenido)
-curl -X DELETE -H "X-Username: jacobo" -H "Content-Type: application/json" \
+curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"path":"/docs/informes/prueba.txt"}' http://localhost:8000/fs/rm
 
 # Borrar un subárbol completo
-curl -X DELETE -H "X-Username: jacobo" -H "Content-Type: application/json" \
+curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"path":"/docs","recursive":true}' http://localhost:8000/fs/rmdir
 ```
 
@@ -124,28 +165,28 @@ contrato de la sección 2 de [`CONTRATOS.md`](./CONTRATOS.md).
 - `PUT` no crea directorios intermedios: el directorio padre debe
   existir de antes (vía RF1).
 
-Autenticación: igual que el resto del servicio, con el header
-`X-Username` (ver `app/deps.py`).
+Autenticación: igual que el resto del servicio, con el JWT del login
+(ver `app/deps.py`).
 
-### Ejemplos (con el servidor corriendo en `localhost:8000`)
+### Ejemplos (con el servidor corriendo en `localhost:8000` y `$TOKEN` del login)
 
 ```bash
 # Subir un archivo
-curl -X PUT -H "X-Username: pau" --data-binary "@archivo.txt" \
+curl -X PUT -H "Authorization: Bearer $TOKEN" --data-binary "@archivo.txt" \
   http://localhost:8000/files/archivo.txt
 
 # Ver metadata sin descargar contenido
-curl -I -H "X-Username: pau" http://localhost:8000/files/archivo.txt
+curl -I -H "Authorization: Bearer $TOKEN" http://localhost:8000/files/archivo.txt
 
 # Descargar
-curl -H "X-Username: pau" http://localhost:8000/files/archivo.txt \
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/files/archivo.txt \
   -o descargado.txt
 ```
 
 ## Modelo de datos
 
-- **users**: dueños de archivos y directorios (sin autenticación real en
-  el Hito 1; ver `app/deps.py`).
+- **users**: dueños de archivos y directorios, con `password_hash` para
+  el login (ver `app/routers/auth.py`).
 - **directories**: árbol jerárquico autorreferenciado (`parent_id`). La
   raíz (`/`) es la fila con `parent_id = NULL`.
 - **files**: hojas del árbol, siempre dentro de un `directory`. Guardan

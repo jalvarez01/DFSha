@@ -64,13 +64,14 @@ trabajo local.
 
 ## Decisiones de diseño (por si preguntan en la sustentación)
 
-- **Login sin JWT real**: el servidor de este hito NO valida contraseñas
-  todavía (ver `app/deps.py::get_current_user` — autenticación real es
-  un placeholder). Por eso `dfsha login` pide usuario/contraseña (para
-  que el flujo de usuario final ya esté listo) pero solo usa el usuario:
-  la lógica de auth vive aislada en `auth.py` (`build_auth_headers`),
-  así que cuando el equipo agregue un endpoint real de login con JWT,
-  ese es el único archivo que hay que tocar.
+- **Login con JWT**: `dfsha login <usuario>` pide la contraseña, la manda
+  a `POST /auth/login` y guarda el token devuelto en
+  `~/.dfsha/session.json` (permisos 600). Todas las peticiones siguientes
+  viajan con `Authorization: Bearer <token>`. Toda la lógica de auth vive
+  aislada en `auth.py` (`login` + `build_auth_headers`): ni `client.py` ni
+  los comandos de `app.py` saben cómo se autentica. El token caduca (12h
+  por defecto), y cuando eso pasa la API responde 401 y basta con volver a
+  hacer `login`.
 - **`cd` es 100% del lado del cliente**: `CONTRATOS.md` dice explícitamente
   que para el Hito 1 monolítico la CLI debe mandar siempre rutas
   absolutas y no usar `cwd_id`. Por eso el "directorio de trabajo" se

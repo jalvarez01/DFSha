@@ -9,7 +9,8 @@ reescriban.
 Todos los endpoints deben:
 - Recibir `db: Session = Depends(get_db)` (de `app.database`).
 - Recibir `user: User = Depends(get_current_user)` (de `app.deps`) para
-  saber quién es el dueño de la operación (header `X-Username`).
+  saber quién es el dueño de la operación (header `Authorization: Bearer
+  <jwt>`, o el header heredado `X-Username`; ver sección 0).
 - Resolver rutas usando **únicamente** las funciones de
   `app/path_service.py` (no reimplementar split/normalize a mano).
 - Capturar las excepciones de `path_service` y traducirlas a HTTP así:
@@ -24,8 +25,9 @@ Todos los endpoints deben:
 | `RootOperationError`               | 400 | `root_operation` |
 | `DirectoryNotEmptyError` (propia de `fs.py`) | 409 | `directory_not_empty` |
 
-Fuera de esa tabla, la app devuelve además `401 unauthenticated` (falta el
-header `X-Username`, ver `app/deps.py`) y `422 validation_error` (cuerpo de
+Fuera de esa tabla, la app devuelve además `401 unauthenticated` (no vino
+ningún header de autenticación), `401 invalid_token` (JWT inválido o
+expirado), `401 invalid_credentials` (login fallido) y `422 validation_error` (cuerpo de
 request malformado; un manejador en `app/main.py` lo reescribe al formato
 `ErrorResponse` en vez del `detail` en forma de lista que trae FastAPI).
 
@@ -44,6 +46,47 @@ manda y la ruta es relativa, `path_service` lanza `InvalidPathError`. Para
 el Hito 1 monolítico, lo más simple es que **la CLI siempre mande rutas
 absolutas** y nadie necesite preocuparse por `cwd_id`; lo dejamos definido
 por si se quiere soportar `cd` más adelante.
+
+---
+
+## 0. Autenticación — `POST /auth/login`
+
+**Estado: implementado** en `app/routers/auth.py`, registrado en `main.py`
+con `prefix="/auth"`. Es el único endpoint público (no exige autenticación).
+
+Request: `LoginRequest` — `{"username": str, "password": str}`.
+
+Response `200`: `TokenResponse`
+
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "bearer",
+  "expires_in": 43200,
+  "username": "mariana"
+}
+```
+
+- El token es un JWT HS256 con `sub` (username), `uid` (id del usuario),
+  `iat` y `exp`. Vive `DFSHA_JWT_EXPIRE_MINUTES` (12 h por defecto) y se
+  firma con `DFSHA_JWT_SECRET` — variable obligatoria fuera de desarrollo.
+- Las contraseñas se guardan hasheadas con PBKDF2-HMAC-SHA256 (con salt) en
+  `users.password_hash`. Ver `app/security.py`.
+- No hay endpoint de registro: el primer login de un username sin
+  contraseña fija la que se envíe, y los siguientes la verifican. Con
+  credenciales incorrectas responde `401 invalid_credentials`, con el mismo
+  mensaje siempre para no revelar qué usernames existen.
+
+El cliente manda el token en cada petición posterior:
+
+```
+Authorization: Bearer <access_token>
+```
+
+`X-Username` se sigue aceptando como fallback de desarrollo (no verifica
+nada y autocrea el usuario); si vienen los dos headers, gana el token.
+El control de acceso por usuario —impedir que un usuario toque los
+archivos de otro— es del Hito 3: hoy el namespace es global.
 
 ---
 
@@ -177,6 +220,125 @@ por HTTP. Contrato que sí debe respetar:
   leyendo `detail.error` / `detail.message` del `ErrorResponse`.
 - Base URL configurable (variable de entorno o flag), por defecto
   `http://localhost:8000`.
+
+---
+
+---
+
+# Hito 2 — ControlNode (DFS distribuido por bloques)
+
+Estos endpoints los implemento yo (Juan) en el ControlNode. Fijan el
+contrato para que los demás codeen en paralelo:
+
+- **Jacobo (DataNode)** consume `register` / `heartbeat`.
+- **Paulina (RF2 distribuido)** consume `allocate` → sube bloques a los
+  DataNodes → `confirm`; y `blocks` para leer.
+- **Mariana (cliente + spec)** documenta estos 4 flujos y propaga el JWT.
+
+Modelos Pydantic nuevos en `app/schemas.py` (importarlos, no reescribirlos):
+`DataNodeRegisterRequest`, `HeartbeatRequest`, `DataNodeInfo`,
+`HeartbeatResponse`, `DataNodeLocation`, `AllocateRequest`,
+`AllocatedBlock`, `AllocateResponse`, `ConfirmBlock`, `ConfirmRequest`,
+`ConfirmResponse`, `BlockPlacement`, `BlocksResponse`.
+
+Tablas nuevas en `app/models.py`: `datanodes` (host, puerto, estado,
+último heartbeat) y `blocks` (block_id, file_id, índice, tamaño, checksum,
+datanode_id, committed).
+
+## 4. DataNode ↔ ControlNode — `app/routers/datanodes.py` (prefix `/datanodes`)
+
+**Sin autenticación de usuario** (tráfico interno nodo↔control; el
+aseguramiento nodo-a-nodo es del Hito 3).
+
+### `POST /datanodes/register`
+
+Registra un DataNode al arrancar; idempotente por `node_id` (si ya existe,
+actualiza host/puerto y lo reactiva). Cuenta como un heartbeat.
+
+- Body: `DataNodeRegisterRequest` (`{"node_id": str, "host": str, "port": int}`).
+- Respuesta `200`: `DataNodeInfo`.
+
+### `POST /datanodes/heartbeat`
+
+Refresca el heartbeat de un DataNode ya registrado.
+
+- Body: `HeartbeatRequest` (`{"node_id": str}`).
+- Respuesta `200`: `HeartbeatResponse`.
+- Errores: `404 unknown_datanode` (el node_id no está registrado → debe
+  llamar antes a `/register`).
+
+### `GET /datanodes`
+
+Lista los DataNodes conocidos con su liveness **calculada** al momento
+(`status`: `alive`/`dead` según heartbeat_ttl, no solo el último valor).
+
+- Respuesta `200`: `list[DataNodeInfo]`.
+
+**Liveness:** un DataNode está "vivo" si su último heartbeat cae dentro de
+`DFSHA_HEARTBEAT_TTL_SECONDS` (30 s por defecto). Los DataNodes deben latir
+a un intervalo holgadamente menor (p. ej. 10 s).
+
+## 5. Cliente ↔ ControlNode — `app/routers/control.py` (prefix `/files`)
+
+**Requieren autenticación** (`get_current_user`), igual que el resto de la
+API de archivos. Traducen las excepciones de `path_service` con la misma
+tabla de códigos de arriba.
+
+> **Enrutado:** estas rutas usan `/files/{path:path}/<acción>` y conviven
+> con el catch-all `/files/{path:path}` de transferencia. El router de
+> control se registra **antes** en `main.py`. Consecuencia: `allocate`,
+> `confirm` y `blocks` quedan reservados como último segmento de una ruta
+> bajo `/files`.
+
+### `POST /files/{path}/allocate` — plan de escritura (fase 1)
+
+El cliente informa el tamaño total; el ControlNode parte el archivo en
+bloques (`ceil(size / block_size)`; el último lleva el resto), los asigna
+**round-robin sobre DataNodes vivos**, persiste las filas `blocks` en
+`committed=False` y devuelve dónde subir cada uno. No recibe contenido.
+
+- Body: `AllocateRequest` (`{"size_bytes": int, "block_size": int | null}`).
+  Si `block_size` es null se usa `DFSHA_BLOCK_SIZE_BYTES` (8 MiB).
+- Respuesta `200`: `AllocateResponse` — `blocks: [AllocatedBlock]`, cada
+  uno con `index`, `block_id`, `size_bytes` y `datanode` (host/puerto).
+- Un archivo vacío (`size_bytes: 0`) devuelve `blocks: []`.
+- Re-allocate sobre un archivo existente descarta el plan anterior (mismo
+  `file_id`, nuevos `block_id`).
+- Errores: `404 not_found` (el padre no existe), `409 not_a_directory`
+  (ya hay un directorio con ese nombre), `503 no_datanodes` (no hay
+  DataNodes vivos), `400 invalid_path`.
+
+El cliente sube cada bloque a su DataNode: `PUT {datanode}/blocks/{block_id}`.
+
+### `POST /files/{path}/confirm` — cierre de la escritura (fase 2)
+
+Tras subir los bloques, el cliente reporta checksums y tamaños reales. El
+ControlNode marca esos bloques `committed=True` y recalcula el tamaño del
+archivo como la suma de los bloques confirmados.
+
+- Body: `ConfirmRequest` (`{"blocks": [{"block_id", "checksum", "size_bytes"}]}`).
+- Respuesta `200`: `ConfirmResponse` (`complete=true` si se confirmaron
+  todos los bloques planificados).
+- Errores: `404 not_found` (el archivo no existe), `409 not_a_file`,
+  `400 unknown_block` (un `block_id` no pertenece a ese archivo).
+
+### `GET /files/{path}/blocks` — plan de lectura
+
+Devuelve, en orden por `index`, de qué DataNode bajar cada bloque
+**confirmado** y con qué checksum verificarlo. El cliente descarga
+(`GET {datanode}/blocks/{block_id}`), verifica y reensambla.
+
+- Respuesta `200`: `BlocksResponse` — `blocks: [BlockPlacement]`.
+- Un archivo sin bloques confirmados devuelve `blocks: []`.
+- Errores: `404 not_found`, `409 not_a_file`.
+
+## Infraestructura
+
+`docker-compose.yml` (raíz) levanta 1 ControlNode + 3 DataNodes en la red
+`dfsha_net`. El servicio `./datanode` (Jacobo) debe leer el contrato de
+variables de entorno documentado como comentario en el compose
+(`DFSHA_DATANODE_ID`, `DFSHA_CONTROLNODE_URL`, `DFSHA_DATANODE_ADVERTISE_HOST/PORT`,
+`DFSHA_HEARTBEAT_INTERVAL`).
 
 ---
 

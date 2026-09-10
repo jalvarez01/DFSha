@@ -95,11 +95,10 @@ def login(
         DEFAULT_BASE_URL, "--base-url", "-u", help="URL base del servidor DFSha"
     ),
 ):
-    """Inicia sesión contra el servidor DFSha y guarda la sesión localmente.
+    """Inicia sesión contra el servidor DFSha (usuario/contraseña) y guarda
+    el JWT devuelto en la sesión local (~/.dfsha/session.json).
 
-    Nota: en el Hito 1 el servidor todavía no valida contraseñas (no hay
-    login real / JWT); se pide la contraseña para que el flujo de usuario
-    ya quede definitivo, pero solo se verifica que el servidor responda.
+    Si el usuario no tiene contraseña todavía, este primer login la fija.
     """
     password = typer.prompt("Contraseña", hide_input=True)
     try:
