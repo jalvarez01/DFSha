@@ -1,0 +1,134 @@
+# docker-compose del clúster DFSha (Hito 2): 1 ControlNode + N DataNodes.
+#
+# Levanta el servicio distribuido completo en una red privada (`dfsha_net`),
+# tal como pide la Opción 1 (C/S con distribución S2S, sistema autónomo):
+#
+#   - controlnode : esta app FastAPI en su rol de NameNode/HDFS. Guarda solo
+#                   metadatos (namespace + tabla de bloques) y decide el
+#                   placement. Es el único con estado en SQLite.
+#   - datanode-1..3 : servicios de bloques (carpeta ./datanode, a cargo de
+#                   Jacobo). Cada uno se registra y late contra el
+#                   ControlNode y almacena los bloques que le asignen.
+#
+# Para escalar el número de DataNodes basta con copiar un bloque `datanode-N`
+# (cada uno con su node_id, su puerto y su volumen). Se dejan 3 como ejemplo.
+#
+# --- Contrato ControlNode <-> DataNode -------------------------------------
+# El servicio ./datanode DEBE leer estas variables de entorno y, al arrancar,
+# hacer `POST {DFSHA_CONTROLNODE_URL}/datanodes/register` con:
+#     { "node_id": DFSHA_DATANODE_ID,
+#       "host":    DFSHA_DATANODE_ADVERTISE_HOST,
+#       "port":    DFSHA_DATANODE_ADVERTISE_PORT }
+# y luego `POST /datanodes/heartbeat` con { "node_id": ... } cada
+# DFSHA_HEARTBEAT_INTERVAL segundos (holgadamente < heartbeat_ttl del
+# ControlNode, 30 s por defecto). `host`/`port` son la dirección con la que
+# el CLIENTE alcanza al DataNode para subir/bajar bloques.
+#
+# NOTA sobre `host`: aquí se anuncia el nombre de servicio de Docker
+# (datanode-1, etc.), válido para un cliente que corra DENTRO de la red del
+# compose. Si el cliente corre en la máquina anfitriona, cambia
+# DFSHA_DATANODE_ADVERTISE_HOST a una dirección alcanzable desde el host
+# (p. ej. host.docker.internal o la IP de la VM) — por eso además se publican
+# los puertos de cada DataNode al host.
+
+services:
+  controlnode:
+    build: .
+    image: dfsha-controlnode:hito2
+    container_name: dfsha-controlnode
+    environment:
+      # Secreto JWT compartido por todo el servicio (obligatorio fuera de dev).
+      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+      # Metadatos en el volumen persistente.
+      DFSHA_DATABASE_URL: "sqlite:////data/dfsha.db"
+      DFSHA_STORAGE_DIR: "/data/blocks"
+      # Tamaño de bloque y ventana de liveness (opcionales; valen los defaults).
+      DFSHA_BLOCK_SIZE_BYTES: "8388608"       # 8 MiB
+      DFSHA_HEARTBEAT_TTL_SECONDS: "30"
+    ports:
+      - "8000:8000"
+    volumes:
+      - controlnode_data:/data
+    networks:
+      - dfsha_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  datanode-1:
+    build: ./datanode          # servicio de bloques (Jacobo)
+    image: dfsha-datanode:hito2
+    container_name: dfsha-datanode-1
+    depends_on:
+      controlnode:
+        condition: service_healthy
+    environment:
+      DFSHA_DATANODE_ID: "datanode-1"
+      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
+      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-1"
+      DFSHA_DATANODE_ADVERTISE_PORT: "8001"
+      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
+      DFSHA_HEARTBEAT_INTERVAL: "10"
+      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+    ports:
+      - "8001:8001"
+    volumes:
+      - datanode1_data:/data
+    networks:
+      - dfsha_net
+
+  datanode-2:
+    build: ./datanode
+    image: dfsha-datanode:hito2
+    container_name: dfsha-datanode-2
+    depends_on:
+      controlnode:
+        condition: service_healthy
+    environment:
+      DFSHA_DATANODE_ID: "datanode-2"
+      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
+      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-2"
+      DFSHA_DATANODE_ADVERTISE_PORT: "8002"
+      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
+      DFSHA_HEARTBEAT_INTERVAL: "10"
+      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+    ports:
+      - "8002:8002"
+    volumes:
+      - datanode2_data:/data
+    networks:
+      - dfsha_net
+
+  datanode-3:
+    build: ./datanode
+    image: dfsha-datanode:hito2
+    container_name: dfsha-datanode-3
+    depends_on:
+      controlnode:
+        condition: service_healthy
+    environment:
+      DFSHA_DATANODE_ID: "datanode-3"
+      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
+      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-3"
+      DFSHA_DATANODE_ADVERTISE_PORT: "8003"
+      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
+      DFSHA_HEARTBEAT_INTERVAL: "10"
+      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+    ports:
+      - "8003:8003"
+    volumes:
+      - datanode3_data:/data
+    networks:
+      - dfsha_net
+
+networks:
+  dfsha_net:
+    driver: bridge
+
+volumes:
+  controlnode_data:
+  datanode1_data:
+  datanode2_data:
+  datanode3_data:

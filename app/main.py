@@ -14,13 +14,16 @@ funciones de app/path_service.py.
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.models import User
 from app.path_service import get_or_create_root
+from app.schemas import ErrorResponse
 
 
 def _seed_root_directory() -> None:
@@ -61,6 +64,28 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Traduce los errores de validación de FastAPI al formato ErrorResponse.
+
+    Por defecto FastAPI devuelve un 422 con `detail` como lista de errores,
+    que rompe el contrato de CONTRATOS.md (todo error debe tener la forma
+    {"error": ..., "message": ...}) y deja al cliente sin un mensaje legible.
+    """
+    problems = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in exc.errors()
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": ErrorResponse(
+                error="validation_error",
+                message=f"Petición inválida: {problems}" if problems else "Petición inválida",
+            ).model_dump()
+        },
+    )
+
+
 @app.get("/health", tags=["infra"])
 def health() -> dict[str, str]:
     """Endpoint de salud. Útil para healthchecks de Docker/orquestador."""
@@ -68,11 +93,24 @@ def health() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------
-# Routers de mis compañeros.
+# Routers de negocio. Las rutas de /fs son estáticas, así que no compiten
+# con el catch-all /files/{path:path} y el orden de registro es indiferente.
 #
-# from app.routers.fs import router as fs_router
-# app.include_router(fs_router, prefix="/fs", tags=["fs"])
+# OJO con /files: el router de control (Hito 2) expone rutas con sufijo de
+# acción sobre el mismo prefijo — /files/{path}/allocate|/confirm|/blocks —
+# y el de transferencia reclama el catch-all /files/{path:path}. El de
+# control DEBE registrarse ANTES para que, p. ej., `GET /files/a/blocks`
+# resuelva al plan de lectura y no a "descargar el archivo /a/blocks".
+# Ver el docstring de app/routers/control.py.
 # ---------------------------------------------------------------------
+from app.routers.auth import router as auth_router
+from app.routers.control import router as control_router
+from app.routers.datanodes import router as datanodes_router
+from app.routers.fs import router as fs_router
 from app.routers.transfer import router as transfer_router
 
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(fs_router, prefix="/fs", tags=["fs"])
+app.include_router(datanodes_router, prefix="/datanodes", tags=["datanodes"])
+app.include_router(control_router, prefix="/files", tags=["control"])
 app.include_router(transfer_router, prefix="/files", tags=["transfer"])
