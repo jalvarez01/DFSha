@@ -7,9 +7,9 @@ Stack: Python 3.11, FastAPI, SQLite (SQLAlchemy), Pydantic.
 
 ## Alcance de este repo en el Hito 1
 
-El Hito 1 está completo: **servidor core y modelo de datos** (Juan),
-**RF1 — gestión del sistema de archivos** (Jacobo), **RF2 —
-transferencia de archivos** (Paulina) y la **CLI** (Mariana). Las firmas
+El Hito 1 está completo: **servidor core y modelo de datos** ,
+**RF1 — gestión del sistema de archivos**, **RF2 —
+transferencia de archivos**  y la **CLI** . Las firmas
 exactas de cada endpoint están en [`CONTRATOS.md`](./CONTRATOS.md).
 
 La autenticación básica user/pass con JWT que pide el enunciado ya está:
