@@ -1,4 +1,4 @@
-# Contratos de API — DFSha (Hito 1)
+# Contratos de API — DFSha (Hitos 1 y 2)
 
 Este documento fija la firma exacta de los endpoints que **no** implemento
 yo, para que cada compañero pueda empezar a codear en paralelo sin
@@ -253,9 +253,23 @@ Modelos Pydantic nuevos en `app/schemas.py` (importarlos, no reescribirlos):
   `BlockPlacement` incluyen `file_id`: es lo que el cliente manda como
   `?file_id=` al hacer `PUT {datanode}/blocks/{block_id}`.
 
+- **Borrado distribuido vía heartbeat** (como el NameNode de HDFS): el
+  ControlNode nunca llama a los DataNodes. Cuando un bloque sale del
+  namespace se encola en `pending_deletions` y viaja en la respuesta del
+  heartbeat (ver sección 4).
+- **JWT también en el DataNode**: el cliente manda el mismo token del
+  login; el DataNode lo valida con el secreto compartido
+  (`DFSHA_JWT_SECRET`).
+
 Tablas nuevas en `app/models.py`: `datanodes` (host, puerto, estado,
-último heartbeat) y `blocks` (block_id, file_id, índice, tamaño, checksum,
-datanode_id, committed).
+último heartbeat), `blocks` (block_id, file_id, índice, tamaño, checksum,
+datanode_id, committed; único por `(file_id, block_index, committed)`) y
+`pending_deletions` (datanode_id, block_id, file_id). Al arrancar,
+`app/main.py` migra la tabla `blocks` de BD creadas con la unicidad vieja
+`(file_id, block_index)`.
+
+La especificación completa de protocolos, con los diagramas de los cuatro
+flujos, está en [`docs/ESPECIFICACION_HITO2.md`](docs/ESPECIFICACION_HITO2.md).
 
 ## 4. DataNode ↔ ControlNode — `app/routers/datanodes.py` (prefix `/datanodes`)
 
@@ -272,10 +286,22 @@ actualiza host/puerto y lo reactiva). Cuenta como un heartbeat.
 
 ### `POST /datanodes/heartbeat`
 
-Refresca el heartbeat de un DataNode ya registrado.
+Refresca el heartbeat de un DataNode ya registrado y le entrega las órdenes
+de borrado pendientes (RF1 distribuido).
 
-- Body: `HeartbeatRequest` (`{"node_id": str}`).
-- Respuesta `200`: `HeartbeatResponse`.
+- Body: `HeartbeatRequest` —
+  `{"node_id": str, "deleted_blocks": [str]}`. `deleted_blocks` (opcional,
+  `[]` por defecto) acusa los bloques que el nodo ya borró.
+- Respuesta `200`: `HeartbeatResponse` —
+  `{"node_id", "status", "last_heartbeat", "delete_blocks": [str]}`.
+  `delete_blocks` son los `block_id` que el nodo debe borrar de su disco
+  (máx. 1000 por latido).
+- Entrega **al-menos-una-vez**: una orden se repite en cada heartbeat
+  hasta que el nodo la acusa en `deleted_blocks`. Borrar es idempotente,
+  así que el nodo acusa también los bloques que ya no tenía.
+- Se encola una orden cuando un bloque sale del namespace: `rm`,
+  `rmdir --recursive`, re-`allocate` de un archivo, confirmación de un
+  reemplazo de bloque, o `PUT` del Hito 1 sobre un archivo distribuido.
 - Errores: `404 unknown_datanode` (el node_id no está registrado → debe
   llamar antes a `/register`).
 
@@ -315,7 +341,9 @@ bloques (`ceil(size / block_size)`; el último lleva el resto), los asigna
   uno con `index`, `block_id`, `size_bytes` y `datanode` (host/puerto).
 - Un archivo vacío (`size_bytes: 0`) devuelve `blocks: []`.
 - Re-allocate sobre un archivo existente descarta el plan anterior (mismo
-  `file_id`, nuevos `block_id`).
+  `file_id`, nuevos `block_id`) y ordena borrar sus bloques en los
+  DataNodes. Si el archivo venía del `PUT` del Hito 1, se borra su blob
+  local.
 - Errores: `404 not_found` (el padre no existe), `409 not_a_directory`
   (ya hay un directorio con ese nombre), `503 no_datanodes` (no hay
   DataNodes vivos), `400 invalid_path`.
@@ -330,10 +358,13 @@ soportar CRUD: reemplaza un bloque existente o anexa uno nuevo al final,
 sin tocar ni re-subir los demás bloques.
 
 - Body: `BlockAllocateRequest` (`{"size_bytes": int}`).
-- `index < len(blocks) actuales`: reemplaza ese bloque (nuevo `block_id`,
-  posiblemente otro DataNode; el contenido viejo queda huérfano en su
-  DataNode anterior, igual que en el re-allocate completo).
-- `index == len(blocks) actuales`: anexa un bloque al final.
+- `index < número de bloques`: reemplaza ese bloque. Crea una fila
+  **pendiente** con nuevo `block_id` (posiblemente en otro DataNode); la
+  versión confirmada sigue en el plan de lectura hasta que se confirme la
+  nueva, así que un lector concurrente nunca ve un hueco. Al confirmar, la
+  vieja sale del namespace y se ordena su borrado a su DataNode. Pedir otro
+  reemplazo del mismo índice antes de confirmar descarta el anterior.
+- `index == número de bloques`: anexa un bloque al final.
 - Respuesta `200`: `AllocatedBlock` (un solo bloque, no una lista).
 - Errores: `404 not_found` (el archivo no existe — debe existir ya, aunque
   sea vacío, vía un `allocate` previo), `409 not_a_file`,
@@ -354,8 +385,10 @@ ControlNode marca esos bloques `committed=True` y recalcula el tamaño del
 archivo como la suma de los bloques confirmados.
 
 - Body: `ConfirmRequest` (`{"blocks": [{"block_id", "checksum", "size_bytes"}]}`).
-- Respuesta `200`: `ConfirmResponse` (`complete=true` si se confirmaron
-  todos los bloques planificados).
+- Respuesta `200`: `ConfirmResponse` (`complete=true` si no queda ningún
+  bloque planificado sin confirmar).
+- Confirmar un bloque que reemplaza a otro del mismo índice borra el viejo
+  del namespace y encola su borrado físico.
 - Errores: `404 not_found` (el archivo no existe), `409 not_a_file`,
   `400 unknown_block` (un `block_id` no pertenece a ese archivo).
 
@@ -369,36 +402,65 @@ Devuelve, en orden por `index`, de qué DataNode bajar cada bloque
 - Un archivo sin bloques confirmados devuelve `blocks: []`.
 - Errores: `404 not_found`, `409 not_a_file`.
 
-## 6. Servicio DataNode — `datanode/` (Jacobo)
+## 6. Servicio DataNode — `datanode/`
 
-**Estado: implementado.** Servicio FastAPI nuevo e independiente del
-ControlNode, sin autenticación de usuario (tráfico interno):
+Servicio FastAPI independiente del ControlNode. Todos los endpoints salvo
+`/health` exigen `Authorization: Bearer <jwt>` (el token de
+`POST /auth/login` del ControlNode, validado con `DFSHA_JWT_SECRET`):
+`401 unauthenticated` si falta, `401 invalid_token` si la firma no cuadra o
+expiró.
 
-- `PUT /blocks/{block_id}?file_id=...` — sube/reemplaza un bloque. Guarda
-  el contenido en `<storage_dir>/<file_id>/<block_id>` (decisión "archivo
-  como directorio, bloque como archivo") y devuelve tamaño + checksum
-  SHA-256 real.
-- `GET /blocks/{block_id}` — descarga un bloque (404 si no existe).
-- `DELETE /blocks/{block_id}` — borra un bloque suelto.
-- `DELETE /files/{file_id}/blocks` — borra TODOS los bloques de un
-  archivo de un golpe; la usa RF1 para propagar `rm` / `rmdir --recursive`
-  a los DataNodes que tengan bloques de los archivos borrados.
+`block_id` y `file_id` solo admiten `[A-Za-z0-9_-]{1,128}`; cualquier otro
+valor (p. ej. `..`) es `400 invalid_id` y no toca el disco.
+
+- `PUT /blocks/{block_id}?file_id=...` — sube/reemplaza un bloque en
+  streaming. Guarda el contenido en `<storage_dir>/<file_id>/<block_id>`
+  y su SHA-256 en `<block_id>.sha256`. Header opcional
+  `X-Checksum-Sha256`: si no coincide con lo recibido, `400
+  checksum_mismatch` y el bloque no se guarda (la versión anterior queda
+  intacta). Respuesta `200`:
+  `{"block_id", "file_id", "size_bytes", "checksum"}`.
+- `GET /blocks/{block_id}` — descarga un bloque en streaming, con headers
+  `Content-Length` y `X-Checksum-Sha256`. Antes de servirlo verifica el
+  contenido contra el checksum guardado: `500 corrupt_block` si no
+  coincide, `404 not_found` si no existe.
+- `DELETE /blocks/{block_id}` — borra un bloque suelto (`404` si no existe).
+- `DELETE /files/{file_id}/blocks` — borra todos los bloques de un archivo
+  en ese nodo (uso manual/administración; el flujo normal de borrado va por
+  el heartbeat).
 - `GET /health`.
 
-Al arrancar (y cada `DFSHA_HEARTBEAT_INTERVAL` segundos) se registra y
-late contra el ControlNode (`app/datanode/registration.py`), reintentando
-solo si falla — así puede arrancar antes que el ControlNode sin caerse.
+Al arrancar se registra contra el ControlNode y luego late cada
+`DFSHA_HEARTBEAT_INTERVAL` segundos (`datanode/app/registration.py`),
+reintentando si falla, así que puede arrancar antes que el ControlNode. En
+cada respuesta ejecuta las órdenes `delete_blocks` y las acusa en el
+heartbeat siguiente. Si el ControlNode responde `404 unknown_datanode`, se
+vuelve a registrar.
 
 Variables de entorno (`datanode/app/config.py`, prefijo `DFSHA_`):
 `DATANODE_ID`, `CONTROLNODE_URL`, `DATANODE_ADVERTISE_HOST`,
 `DATANODE_ADVERTISE_PORT` (también el puerto en el que escucha uvicorn,
-ver `datanode/Dockerfile`), `HEARTBEAT_INTERVAL`, `DATANODE_STORAGE_DIR`.
+ver `datanode/Dockerfile`), `HEARTBEAT_INTERVAL`, `DATANODE_STORAGE_DIR`,
+`JWT_SECRET`.
+
+## 7. Cliente — `cli/`
+
+`dfsha put` y `dfsha get` usan el flujo distribuido
+(`cli/dfsha_cli/distributed.py`): `allocate`, subida de cada bloque en
+paralelo a su DataNode con `X-Checksum-Sha256`, y `confirm`; para leer,
+`blocks` y descarga paralela verificando el checksum de cada bloque. Manda
+el JWT a ControlNode y DataNodes. Un archivo subido con el `PUT` del
+Hito 1 (sin bloques) se descarga por el `GET` monolítico.
+
+`GET /files/{path}` del Hito 1 sobre un archivo distribuido responde
+`409 distributed_file` (el ControlNode no tiene su contenido).
 
 ## Infraestructura
 
-`docker-compose.yml` (raíz) levanta 1 ControlNode + 3 DataNodes en la red
-`dfsha_net`, cada uno con su propio `DFSHA_DATANODE_ID` y
-`DFSHA_DATANODE_ADVERTISE_HOST/PORT` apuntando al nombre de su servicio.
+`docker-compose.yml` (raíz) levanta 1 ControlNode y 3 DataNodes en la red
+`dfsha_net`. Cada DataNode anuncia `localhost:<su puerto>` (8001–8003,
+publicados en el host) para que la CLI de la máquina anfitriona los
+alcance. Todos comparten `DFSHA_JWT_SECRET`.
 
 ---
 
@@ -406,9 +468,13 @@ ver `datanode/Dockerfile`), `HEARTBEAT_INTERVAL`, `DATANODE_STORAGE_DIR`.
 
 | Módulo | Contenido |
 |---|---|
-| `app/models.py` | `User`, `Directory`, `File` (SQLAlchemy) |
+| `app/models.py` | `User`, `Directory`, `File`, `DataNode`, `Block`, `PendingDeletion` (SQLAlchemy) |
 | `app/database.py` | `engine`, `SessionLocal`, `get_db` |
 | `app/deps.py` | `get_current_user` |
 | `app/path_service.py` | Resolución/validación de rutas, excepciones |
+| `app/placement.py` | Liveness de DataNodes, partición y round-robin |
+| `app/block_gc.py` | Cola de borrado de bloques (`discard_blocks`) |
 | `app/schemas.py` | Todos los modelos Pydantic mencionados arriba |
-| `app/main.py` | App FastAPI, `/health`, seed de la raíz |
+| `app/main.py` | App FastAPI, `/health`, seed de la raíz, migración de `blocks` |
+| `datanode/` | Servicio DataNode |
+| `cli/dfsha_cli/distributed.py` | put/get por bloques |

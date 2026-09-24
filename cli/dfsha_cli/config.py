@@ -34,3 +34,12 @@ CHUNK_SIZE = 64 * 1024
 # put/get de archivos grandes, donde se usa un timeout más permisivo).
 DEFAULT_TIMEOUT = 10.0
 UPLOAD_DOWNLOAD_TIMEOUT = 120.0
+
+# --- Hito 2: transferencia por bloques -----------------------------------
+# Cuántos bloques se suben/bajan a la vez contra los DataNodes.
+PARALLEL_TRANSFERS = int(os.getenv("DFSHA_PARALLEL_TRANSFERS", "4"))
+
+# Tamaño de bloque que pide `put` al ControlNode. Vacío = el que tenga
+# configurado el ControlNode (8 MiB por defecto). Útil para la demo: con
+# DFSHA_BLOCK_SIZE=65536 un archivo pequeño ya se reparte en varios nodos.
+DEFAULT_BLOCK_SIZE = int(os.getenv("DFSHA_BLOCK_SIZE")) if os.getenv("DFSHA_BLOCK_SIZE") else None

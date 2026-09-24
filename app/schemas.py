@@ -205,6 +205,13 @@ class HeartbeatRequest(BaseModel):
     """Cuerpo de POST /datanodes/heartbeat."""
 
     node_id: str = Field(min_length=1, max_length=128)
+    deleted_blocks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Acuse de recibo: block_ids que el DataNode ya borró de su disco "
+            "(de órdenes `delete_blocks` de heartbeats anteriores)"
+        ),
+    )
 
 
 class DataNodeInfo(BaseModel):
@@ -226,6 +233,14 @@ class HeartbeatResponse(BaseModel):
     node_id: str
     status: DataNodeStatus
     last_heartbeat: datetime
+    delete_blocks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Órdenes de borrado: block_ids que el DataNode debe eliminar de su "
+            "disco (el namespace ya no los referencia). Debe acusarlos en el "
+            "siguiente heartbeat vía `deleted_blocks`."
+        ),
+    )
 
 
 class DataNodeLocation(BaseModel):

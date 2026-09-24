@@ -13,7 +13,12 @@ o el ControlNode + al menos 1 DataNode corriendo localmente), este script:
    DataNode, verifica su checksum y reensambla — compara contra el
    contenido original.
 4. Reemplaza el bloque 0 vía el endpoint CRUD
-   (`POST .../blocks/0/allocate`) y confirma que SOLO ese bloque cambió.
+   (`POST .../blocks/0/allocate`) y confirma que SOLO ese bloque cambió, y
+   que mientras el reemplazo no se confirma se sigue leyendo el viejo.
+5. Seguridad del DataNode: sin JWT responde 401 y un checksum que no
+   coincide se rechaza.
+6. RF1 distribuido: borra el archivo (`rm`) y espera a que cada DataNode
+   elimine sus bloques (las órdenes viajan en el heartbeat).
 
 Uso:
     pip install httpx
@@ -27,6 +32,7 @@ import argparse
 import hashlib
 import os
 import sys
+import time
 
 import httpx
 
@@ -49,6 +55,12 @@ def main() -> int:
     parser.add_argument("--size", type=int, default=200_000, help="Tamaño del archivo de prueba (bytes)")
     parser.add_argument("--block-size", type=int, default=65_536, help="Tamaño de bloque a pedir")
     parser.add_argument("--path", default="/verify_hito2_test.bin")
+    parser.add_argument(
+        "--deletion-timeout",
+        type=float,
+        default=45.0,
+        help="Segundos a esperar a que los DataNodes borren los bloques (≈ 2 heartbeats + margen)",
+    )
     args = parser.parse_args()
 
     failures = 0
@@ -62,7 +74,12 @@ def main() -> int:
         return 1
     token = resp.json()["access_token"]
     client.headers["Authorization"] = f"Bearer {token}"
+    # El mismo JWT se propaga a los DataNodes.
+    dn_client = httpx.Client(timeout=10.0, headers={"Authorization": f"Bearer {token}"})
     ok("login OK, token obtenido")
+
+    # Un archivo de una corrida anterior interrumpida no debe estorbar.
+    client.request("DELETE", "/fs/rm", json={"path": args.path})
 
     # --- 1. Datos de prueba -------------------------------------------
     original = os.urandom(args.size)
@@ -90,7 +107,12 @@ def main() -> int:
         data = original[start : start + block["size_bytes"]]
         dn = block["datanode"]
         put_url = f"http://{dn['host']}:{dn['port']}/blocks/{block['block_id']}"
-        put_resp = httpx.put(put_url, params={"file_id": block["file_id"]}, content=data, timeout=10.0)
+        put_resp = dn_client.put(
+            put_url,
+            params={"file_id": block["file_id"]},
+            content=data,
+            headers={"X-Checksum-Sha256": sha256(data)},
+        )
         if put_resp.status_code != 200:
             fail(f"PUT a datanode {dn['node_id']} falló: {put_resp.status_code} {put_resp.text}")
             return 1
@@ -114,7 +136,7 @@ def main() -> int:
     reassembled = bytearray()
     for block in read_plan["blocks"]:
         dn = block["datanode"]
-        get_resp = httpx.get(f"http://{dn['host']}:{dn['port']}/blocks/{block['block_id']}", timeout=10.0)
+        get_resp = dn_client.get(f"http://{dn['host']}:{dn['port']}/blocks/{block['block_id']}")
         if get_resp.status_code != 200:
             fail(f"GET a datanode {dn['node_id']} falló: {get_resp.status_code}")
             failures += 1
@@ -142,12 +164,19 @@ def main() -> int:
     else:
         alloc = resp.json()
         dn = alloc["datanode"]
-        httpx.put(
+        dn_client.put(
             f"http://{dn['host']}:{dn['port']}/blocks/{alloc['block_id']}",
             params={"file_id": alloc["file_id"]},
             content=new_content,
-            timeout=10.0,
+            headers={"X-Checksum-Sha256": sha256(new_content)},
         )
+        during = client.get(f"/files{args.path}/blocks").json()
+        during_by_index = {b["index"]: b["checksum"] for b in during["blocks"]}
+        if during_by_index == old_checksums:
+            ok("antes de confirmar el reemplazo, el plan de lectura sigue sirviendo la versión vieja")
+        else:
+            fail("el plan de lectura cambió antes de confirmar el reemplazo")
+            failures += 1
         client.post(
             f"/files{args.path}/confirm",
             json={"blocks": [{"block_id": alloc["block_id"], "checksum": sha256(new_content), "size_bytes": len(new_content)}]},
@@ -164,8 +193,62 @@ def main() -> int:
             fail(f"CRUD parcial no se comportó como se esperaba (block0_changed={block0_changed}, others_unchanged={others_unchanged})")
             failures += 1
 
-    # --- Limpieza ----------------------------------------------------
-    client.request("DELETE", f"/fs/rm", json={"path": args.path})
+    # --- 5. Seguridad del DataNode --------------------------------------
+    print("\n[4] Seguridad del DataNode")
+    final_plan = client.get(f"/files{args.path}/blocks").json()
+    sample = final_plan["blocks"][0]
+    dn = sample["datanode"]
+    base_dn = f"http://{dn['host']}:{dn['port']}"
+    anon = httpx.get(f"{base_dn}/blocks/{sample['block_id']}", timeout=10.0)
+    if anon.status_code == 401:
+        ok("GET de bloque sin JWT -> 401")
+    else:
+        fail(f"GET de bloque sin JWT devolvió {anon.status_code}")
+        failures += 1
+    bad = dn_client.put(
+        f"{base_dn}/blocks/verify-bad-checksum",
+        params={"file_id": "verify"},
+        content=b"contenido",
+        headers={"X-Checksum-Sha256": "0" * 64},
+    )
+    if bad.status_code == 400:
+        ok("PUT con checksum incorrecto -> 400 checksum_mismatch")
+    else:
+        fail(f"PUT con checksum incorrecto devolvió {bad.status_code}")
+        failures += 1
+    traversal = dn_client.put(f"{base_dn}/blocks/x", params={"file_id": ".."}, content=b"x")
+    if traversal.status_code == 400:
+        ok("file_id '..' (path traversal) -> 400")
+    else:
+        fail(f"file_id '..' devolvió {traversal.status_code}")
+        failures += 1
+
+    # --- 6. rm distribuido ----------------------------------------------
+    print("\n[5] rm propagado a los DataNodes")
+    # Todos los bloques que llegaron a existir: los del plan final más el
+    # bloque 0 original, reemplazado en el paso 3.
+    all_blocks = {(b["block_id"], b["datanode"]["host"], b["datanode"]["port"]) for b in final_plan["blocks"]}
+    all_blocks |= {(b["block_id"], b["datanode"]["host"], b["datanode"]["port"]) for b in read_plan["blocks"]}
+    resp = client.request("DELETE", "/fs/rm", json={"path": args.path})
+    if resp.status_code != 200:
+        fail(f"rm falló: {resp.status_code} {resp.text}")
+        return 1
+    ok("rm OK en el ControlNode")
+
+    deadline = time.monotonic() + args.deletion_timeout
+    remaining = set(all_blocks)
+    while remaining and time.monotonic() < deadline:
+        for block_id, host, port in list(remaining):
+            r = dn_client.get(f"http://{host}:{port}/blocks/{block_id}")
+            if r.status_code == 404:
+                remaining.discard((block_id, host, port))
+        if remaining:
+            time.sleep(1)
+    if remaining:
+        fail(f"{len(remaining)} bloque(s) siguen en los DataNodes tras {args.deletion_timeout:.0f}s")
+        failures += 1
+    else:
+        ok(f"los {len(all_blocks)} bloque(s) (incluido el reemplazado) desaparecieron de los DataNodes")
 
     print()
     if failures == 0:

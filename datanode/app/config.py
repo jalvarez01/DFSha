@@ -39,5 +39,12 @@ class Settings(BaseSettings):
     # Nombre de variable acordado en docker-compose.yml.
     datanode_storage_dir: Path = Path("/data/blocks")
 
+    # Validación del JWT que el cliente propaga desde el ControlNode
+    # (POST /auth/login). Debe ser el MISMO secreto que usa el ControlNode:
+    # en docker-compose ambos leen DFSHA_JWT_SECRET. El valor por defecto
+    # coincide con el del ControlNode y solo sirve para desarrollo.
+    jwt_secret: str = "dev-secret-cambiar-en-produccion"
+    jwt_algorithm: str = "HS256"
+
 
 settings = Settings()

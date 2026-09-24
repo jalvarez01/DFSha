@@ -10,14 +10,16 @@ parte, normaliza ni valida ninguna ruta a mano.
 
 Dos puntos de diseño que conviene tener presentes al leer el código:
 
-1. Borrado de contenido ("recolección de blobs")
-   Borrar una fila de `files` solo elimina el metadato; el blob y su
-   checksum siguen ocupando disco en STORAGE_DIR. Por eso `rm` y
-   `rmdir --recursive` recogen los ids de los archivos afectados ANTES de
-   borrar y limpian el disco DESPUÉS de que la transacción esté confirmada.
-   Ese orden es deliberado: si falla el borrado en disco quedan blobs
-   huérfanos (desperdicio de espacio, inofensivo), mientras que al revés
-   quedaría metadata apuntando a contenido inexistente (un GET roto).
+1. Borrado de contenido ("recolección de blobs y bloques")
+   Borrar una fila de `files` solo elimina el metadato; el contenido sigue
+   ocupando disco. Por eso `rm` y `rmdir --recursive` recogen los ids de los
+   archivos afectados ANTES de borrar y:
+   - Hito 2 (distribuido): en la misma transacción encolan el borrado de
+     sus bloques en los DataNodes (app/block_gc.py); cada DataNode recibe
+     la orden en su próximo heartbeat.
+   - Hito 1 (monolítico): limpian el blob local DESPUÉS del commit. Si falla
+     el borrado en disco quedan blobs huérfanos (inofensivo), mientras que
+     al revés quedaría metadata apuntando a contenido inexistente.
 
 2. Cascada de borrado
    El subárbol de un `rmdir --recursive` lo borra la cascada del ORM
@@ -33,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.block_gc import discard_blocks_of_files
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import Directory, File, User
@@ -53,11 +56,12 @@ from app.path_service import (
     resolve_parent_and_name,
     split_parent_and_leaf,
 )
-# Se importan las FUNCIONES de transfer, nunca la constante STORAGE_DIR: estas
-# leen el global del módulo en tiempo de llamada, así que siguen respetando el
-# monkeypatch de STORAGE_DIR que hacen los tests. Importar la constante la
-# congelaría en el import y los tests borrarían del almacenamiento real.
-from app.routers.transfer import _blob_path, _checksum_path
+# Se importa la FUNCIÓN de transfer, nunca la constante STORAGE_DIR: la
+# función lee el global del módulo en tiempo de llamada, así que sigue
+# respetando el monkeypatch de STORAGE_DIR que hacen los tests. Importar la
+# constante la congelaría en el import y los tests borrarían del
+# almacenamiento real.
+from app.routers.transfer import delete_local_blobs
 from app.schemas import (
     DeleteResponse,
     DirectoryEntry,
@@ -106,25 +110,6 @@ def _join_path(parent_path: str, leaf: str) -> str:
     if parent_path == "/":
         return f"/{leaf}"
     return f"{parent_path}/{leaf}"
-
-
-def _delete_blobs(file_ids: list[int]) -> None:
-    """Borra del disco el contenido de los archivos indicados.
-
-    Los fallos de disco se ignoran a propósito: en ese punto la transacción
-    ya está confirmada y el namespace es consistente, así que un unlink
-    fallido solo deja un blob huérfano. En Windows es un caso real: una
-    descarga concurrente mantiene el archivo abierto y unlink lanza
-    PermissionError, que sin capturar convertiría un borrado correcto en un
-    error 500.
-    """
-    for file_id in file_ids:
-        blob = _blob_path(file_id)
-        for path in (blob, _checksum_path(file_id), blob.with_suffix(".tmp")):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                continue
 
 
 def _validate_cwd(db: Session, cwd_id: int | None) -> None:
@@ -350,9 +335,10 @@ def remove_directory(
     full_path = get_full_path(db, directory)
     file_ids = _collect_descendant_file_ids(db, directory)
 
+    discard_blocks_of_files(db, file_ids)
     db.delete(directory)
     db.commit()
-    _delete_blobs(file_ids)
+    delete_local_blobs(file_ids)
 
     return DeleteResponse(path=full_path, deleted=True)
 
@@ -393,9 +379,10 @@ def remove_file(
     file_id = file_row.id
     full_path = _join_path(get_full_path(db, file_row.parent), file_row.name)
 
+    discard_blocks_of_files(db, [file_id])
     db.delete(file_row)
     db.commit()
-    _delete_blobs([file_id])
+    delete_local_blobs([file_id])
 
     return DeleteResponse(path=full_path, deleted=True)
 

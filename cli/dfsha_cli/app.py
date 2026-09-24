@@ -12,8 +12,13 @@ Comandos implementados (según el reparto de tareas del equipo):
     dfsha mkdir <ruta> [-p]      Crea un directorio            (RF1)
     dfsha rmdir <ruta> [-r]      Borra un directorio           (RF1)
     dfsha rm <ruta>              Borra un archivo               (RF1)
-    dfsha put <local> [remota]  Sube un archivo                (RF2)
-    dfsha get <remota> [local]  Descarga un archivo            (RF2)
+    dfsha put <local> [remota]  Sube un archivo por bloques     (RF2, Hito 2)
+    dfsha get <remota> [local]  Descarga un archivo por bloques (RF2, Hito 2)
+    dfsha nodes                 Lista los DataNodes del clúster  (Hito 2)
+
+put/get hablan con dos tipos de nodo: el ControlNode para el plan de
+bloques y cada DataNode para los datos (ver distributed.py). El usuario no
+necesita saber dónde cae cada bloque.
 
 Todas las rutas remotas que da el usuario pueden ser absolutas o
 relativas al cwd guardado en la sesión (ver pathutils.resolve_path); la
@@ -34,7 +39,8 @@ from rich.table import Table
 
 from dfsha_cli import auth, pathutils
 from dfsha_cli.client import APIError, ConnectionFailed, DFShaClient, RouteNotImplemented
-from dfsha_cli.config import DEFAULT_BASE_URL
+from dfsha_cli.config import DEFAULT_BASE_URL, DEFAULT_BLOCK_SIZE
+from dfsha_cli.distributed import BlockTransferError, DistributedTransfer, TransferSummary
 
 app = typer.Typer(
     name="dfsha",
@@ -67,6 +73,9 @@ def _handle_errors(func):
             raise typer.Exit(code=1)
         except APIError as exc:
             err_console.print(f"✗ {exc}")
+            raise typer.Exit(code=1)
+        except BlockTransferError as exc:
+            err_console.print(f"✗ Falló la transferencia con un DataNode: {exc}")
             raise typer.Exit(code=1)
         except FileNotFoundError as exc:
             err_console.print(f"✗ Archivo local no encontrado: {exc.filename}")
@@ -274,6 +283,13 @@ def _sha256_of(local_path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _describe_placement(summary: TransferSummary) -> str:
+    if not summary.blocks_per_node:
+        return "sin bloques (archivo vacío)"
+    nodes = ", ".join(f"{node}×{count}" for node, count in sorted(summary.blocks_per_node.items()))
+    return f"{summary.num_blocks} bloque(s) en {nodes}"
+
+
 @app.command()
 @_handle_errors
 def put(
@@ -281,17 +297,29 @@ def put(
     remote_path: Optional[str] = typer.Argument(
         None, help="Ruta remota destino (por defecto: mismo nombre, en el cwd actual)"
     ),
+    block_size: Optional[int] = typer.Option(
+        DEFAULT_BLOCK_SIZE,
+        "--block-size",
+        "-b",
+        min=1,
+        help="Tamaño de bloque en bytes (por defecto, el del ControlNode: 8 MiB)",
+    ),
 ):
-    """Sube (send) un archivo local al servidor."""
+    """Sube (send) un archivo: lo parte en bloques y los sube en paralelo a
+    los DataNodes que asigne el ControlNode."""
     client, session = _load_client_and_session()
     target = _resolve(session, remote_path if remote_path else local_path.name)
 
     size = local_path.stat().st_size
     with console.status(f"Subiendo {local_path.name} ({size} bytes) a {target}..."):
-        data = client.put_file(target, local_path)
+        with DistributedTransfer(client) as transfer:
+            summary = transfer.put(target, local_path, block_size=block_size)
 
-    verb = "creado" if data.get("created") else "sobreescrito"
-    console.print(f"[green]✓[/green] Archivo {verb}: {data['file']['path']} ({data['file']['size_bytes']} bytes)")
+    console.print(f"[green]✓[/green] Archivo subido: {summary.path} ({summary.size_bytes} bytes)")
+    console.print(f"  {_describe_placement(summary)}")
+    if not summary.complete:
+        err_console.print("✗ El ControlNode no dio el archivo por completo; vuelve a subirlo.")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -302,15 +330,29 @@ def get(
         None, help="Archivo local destino (por defecto: mismo nombre, en el directorio actual)"
     ),
 ):
-    """Descarga (receive) un archivo remoto al disco local."""
+    """Descarga (receive) un archivo: baja sus bloques en paralelo desde los
+    DataNodes, verifica el checksum de cada uno y los reensambla en orden."""
     client, session = _load_client_and_session()
     target = _resolve(session, remote_path)
     dest = local_path if local_path is not None else Path(pathutils.leaf_name(target))
 
     with console.status(f"Descargando {target} a {dest}..."):
-        meta = client.get_file(target, dest)
+        plan = client.blocks(target)
+        if plan["num_blocks"] == 0 and client.stat(target)["size_bytes"] > 0:
+            # Archivo subido con el PUT monolítico del Hito 1: su contenido
+            # no está en bloques sino en el servidor.
+            _get_legacy(client, target, dest)
+            return
+        with DistributedTransfer(client) as transfer:
+            summary = transfer.get(target, dest)
 
-    console.print(f"[green]✓[/green] Descargado en {dest} ({dest.stat().st_size} bytes)")
+    console.print(f"[green]✓[/green] Descargado en {dest} ({summary.size_bytes} bytes)")
+    console.print(f"  {_describe_placement(summary)}, checksum de cada bloque verificado")
+
+
+def _get_legacy(client: DFShaClient, target: str, dest: Path) -> None:
+    meta = client.get_file(target, dest)
+    console.print(f"[green]✓[/green] Descargado en {dest} ({dest.stat().st_size} bytes) \\[formato Hito 1]")
 
     expected_checksum = meta.get("checksum_sha256")
     if expected_checksum:
@@ -323,6 +365,22 @@ def get(
                 f"El archivo pudo corromperse en la descarga."
             )
             raise typer.Exit(code=1)
+
+
+@app.command()
+@_handle_errors
+def nodes():
+    """Lista los DataNodes registrados en el ControlNode y su estado."""
+    client, _ = _load_client_and_session()
+    table = Table(title="DataNodes")
+    table.add_column("Nodo")
+    table.add_column("Dirección")
+    table.add_column("Estado")
+    table.add_column("Último heartbeat")
+    for node in client.datanodes():
+        status = "[green]vivo[/green]" if node["status"] == "alive" else "[red]caído[/red]"
+        table.add_row(node["node_id"], f"{node['host']}:{node['port']}", status, str(node["last_heartbeat"]))
+    console.print(table)
 
 
 def main():

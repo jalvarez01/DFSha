@@ -300,11 +300,12 @@ def test_allocate_block_reemplaza_un_bloque_existente_sin_tocar_los_demas(client
     assert replaced["index"] == 1
     assert replaced["block_id"] != old_block_1_id
 
-    # el bloque 0 sigue confirmado con su checksum viejo; el 1 quedó pendiente
+    # Mientras el reemplazo está pendiente, el plan de lectura sigue
+    # sirviendo la versión vieja del bloque 1: un lector nunca ve un hueco.
     read_plan = client.get("/files/data.bin/blocks").json()
-    assert read_plan["num_blocks"] == 1  # solo el índice 0 sigue confirmado
-    assert read_plan["blocks"][0]["index"] == 0
-    assert read_plan["blocks"][0]["checksum"] == "sha-0"
+    assert read_plan["num_blocks"] == 2
+    assert [b["checksum"] for b in read_plan["blocks"]] == ["sha-0", "sha-1"]
+    assert read_plan["blocks"][1]["block_id"] == old_block_1_id
 
     # confirmar el reemplazo
     client.post(
@@ -315,6 +316,7 @@ def test_allocate_block_reemplaza_un_bloque_existente_sin_tocar_los_demas(client
     assert read_plan["num_blocks"] == 2
     assert read_plan["size_bytes"] == 10 + 7  # bloque 0 sin tocar + bloque 1 nuevo
     assert read_plan["blocks"][1]["checksum"] == "sha-1-v2"
+    assert read_plan["blocks"][1]["block_id"] == replaced["block_id"]
 
 
 def test_allocate_block_con_gap_es_400(client):
@@ -339,3 +341,141 @@ def test_allocate_block_de_archivo_inexistente_es_404(client):
     resp = client.post("/files/fantasma.bin/blocks/0/allocate", json={"size_bytes": 3})
     assert resp.status_code == 404
     assert resp.json()["detail"]["error"] == "not_found"
+
+
+# --------------------------------------------------------------------------
+# RF1 distribuido: órdenes de borrado entregadas en el heartbeat
+# --------------------------------------------------------------------------
+def _heartbeat(client, node_id, deleted=()):
+    resp = client.post(
+        "/datanodes/heartbeat", json={"node_id": node_id, "deleted_blocks": list(deleted)}
+    )
+    assert resp.status_code == 200
+    return resp.json()["delete_blocks"]
+
+
+def _write(client, path, size, block_size=10):
+    """allocate + confirm de un archivo; devuelve el plan de escritura."""
+    plan = client.post(f"/files{path}/allocate", json={"size_bytes": size, "block_size": block_size}).json()
+    client.post(
+        f"/files{path}/confirm",
+        json={
+            "blocks": [
+                {"block_id": b["block_id"], "checksum": f"sha-{b['index']}", "size_bytes": b["size_bytes"]}
+                for b in plan["blocks"]
+            ]
+        },
+    )
+    return plan
+
+
+def _ids_by_node(plan):
+    by_node: dict[str, set[str]] = {}
+    for b in plan["blocks"]:
+        by_node.setdefault(b["datanode"]["node_id"], set()).add(b["block_id"])
+    return by_node
+
+
+def test_heartbeat_sin_pendientes_no_ordena_borrar_nada(client):
+    _register_n(client, 1)
+    assert _heartbeat(client, "dn-0") == []
+
+
+def test_rm_ordena_borrar_los_bloques_a_cada_datanode(client):
+    _register_n(client, 2)
+    plan = _write(client, "/a.bin", 30)  # 3 bloques en dn-0, dn-1, dn-0
+    expected = _ids_by_node(plan)
+
+    assert client.request("DELETE", "/fs/rm", json={"path": "/a.bin"}).status_code == 200
+
+    assert set(_heartbeat(client, "dn-0")) == expected["dn-0"]
+    assert set(_heartbeat(client, "dn-1")) == expected["dn-1"]
+
+
+def test_la_orden_se_repite_hasta_que_el_datanode_la_acusa(client):
+    _register_n(client, 1)
+    plan = _write(client, "/a.bin", 20)
+    ids = {b["block_id"] for b in plan["blocks"]}
+    client.request("DELETE", "/fs/rm", json={"path": "/a.bin"})
+
+    # Sin acuse (p. ej. el DataNode se cayó a mitad), la orden vuelve a salir.
+    assert set(_heartbeat(client, "dn-0")) == ids
+    assert set(_heartbeat(client, "dn-0")) == ids
+    # Con acuse, desaparece.
+    assert _heartbeat(client, "dn-0", deleted=ids) == []
+
+
+def test_rmdir_recursivo_ordena_borrar_los_bloques_de_todo_el_subarbol(client):
+    _register_n(client, 1)
+    client.post("/fs/mkdir", json={"path": "/d/e", "parents": True})
+    p1 = _write(client, "/d/uno.bin", 10)
+    p2 = _write(client, "/d/e/dos.bin", 25)
+
+    resp = client.request("DELETE", "/fs/rmdir", json={"path": "/d", "recursive": True})
+    assert resp.status_code == 200
+
+    expected = {b["block_id"] for b in p1["blocks"] + p2["blocks"]}
+    assert set(_heartbeat(client, "dn-0")) == expected
+
+
+def test_rm_de_archivo_a_medio_subir_tambien_ordena_borrar(client):
+    """Un bloque sin confirmar pudo llegar a subirse al DataNode."""
+    _register_n(client, 1)
+    plan = client.post("/files/a.bin/allocate", json={"size_bytes": 10, "block_size": 10}).json()
+    client.request("DELETE", "/fs/rm", json={"path": "/a.bin"})
+    assert _heartbeat(client, "dn-0") == [plan["blocks"][0]["block_id"]]
+
+
+def test_reallocate_ordena_borrar_el_plan_anterior(client):
+    _register_n(client, 1)
+    first = _write(client, "/a.bin", 20)
+    client.post("/files/a.bin/allocate", json={"size_bytes": 5, "block_size": 10})
+    assert set(_heartbeat(client, "dn-0")) == {b["block_id"] for b in first["blocks"]}
+
+
+def test_confirmar_un_reemplazo_ordena_borrar_solo_el_bloque_viejo(client):
+    _register_n(client, 1)
+    plan = _write(client, "/a.bin", 20)
+    old_id = plan["blocks"][1]["block_id"]
+    new = client.post("/files/a.bin/blocks/1/allocate", json={"size_bytes": 3}).json()
+
+    # Antes de confirmar, el viejo sigue en uso: nada que borrar.
+    assert _heartbeat(client, "dn-0") == []
+
+    client.post(
+        "/files/a.bin/confirm",
+        json={"blocks": [{"block_id": new["block_id"], "checksum": "v2", "size_bytes": 3}]},
+    )
+    assert _heartbeat(client, "dn-0") == [old_id]
+
+
+def test_dos_reemplazos_seguidos_descartan_el_pendiente_anterior(client):
+    _register_n(client, 1)
+    _write(client, "/a.bin", 20)
+    first = client.post("/files/a.bin/blocks/0/allocate", json={"size_bytes": 3}).json()
+    second = client.post("/files/a.bin/blocks/0/allocate", json={"size_bytes": 4}).json()
+
+    assert _heartbeat(client, "dn-0") == [first["block_id"]]
+    # Confirmar el segundo deja el archivo completo con 2 bloques.
+    confirmed = client.post(
+        "/files/a.bin/confirm",
+        json={"blocks": [{"block_id": second["block_id"], "checksum": "v2", "size_bytes": 4}]},
+    ).json()
+    assert confirmed["complete"] is True
+    assert confirmed["num_blocks"] == 2
+    assert confirmed["size_bytes"] == 4 + 10
+
+
+def test_reemplazo_pendiente_marca_el_archivo_incompleto(client):
+    _register_n(client, 1)
+    plan = _write(client, "/a.bin", 20)
+    client.post("/files/a.bin/blocks/0/allocate", json={"size_bytes": 3})
+    # Re-confirmar un bloque ya confirmado no cambia nada, y el reemplazo
+    # pendiente sigue haciendo que el archivo no esté completo.
+    b1 = plan["blocks"][1]
+    confirmed = client.post(
+        "/files/a.bin/confirm",
+        json={"blocks": [{"block_id": b1["block_id"], "checksum": "sha-1", "size_bytes": 10}]},
+    ).json()
+    assert confirmed["complete"] is False
+    assert confirmed["num_blocks"] == 2

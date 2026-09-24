@@ -2,6 +2,8 @@
 
 Sistema de archivos distribuido por bloques, estilo HDFS.
 **Hito 1**: versión monolítica cliente/servidor.
+**Hito 2**: ControlNode + N DataNodes, con los archivos particionados en
+bloques (ver [Hito 2](#hito-2--particionamiento-y-dfs-distribuido-por-bloques)).
 
 Stack: Python 3.11, FastAPI, SQLite (SQLAlchemy), Pydantic.
 
@@ -30,7 +32,10 @@ DFSha/
 │   ├── main.py            # App FastAPI, /health, arranque, routers
 │   ├── config.py          # Settings (env vars)
 │   ├── database.py        # engine, SessionLocal, get_db
-│   ├── models.py          # Modelos SQLAlchemy: User, Directory, File
+│   ├── models.py          # Modelos SQLAlchemy: User, Directory, File, DataNode, Block, PendingDeletion
+│   ├── placement.py       # Hito 2: liveness, partición y round-robin
+│   ├── block_gc.py        # Hito 2: cola de borrado de bloques (vía heartbeat)
+│   ├── security.py        # Hash de contraseñas y JWT
 │   ├── path_service.py    # Resolución/validación de rutas (núcleo)
 │   ├── schemas.py         # Contratos Pydantic de request/response
 │   ├── deps.py            # Dependencias compartidas (usuario actual)
@@ -43,18 +48,25 @@ DFSha/
 │   ├── app/
 │   │   ├── config.py      # DFSHA_DATANODE_ID, DFSHA_CONTROLNODE_URL, etc.
 │   │   ├── storage.py     # Storage local: archivo=directorio, bloque=archivo
-│   │   ├── registration.py # register/heartbeat periódico contra el ControlNode
+│   │   ├── registration.py # register/heartbeat + órdenes de borrado
+│   │   ├── security.py    # validación del JWT del cliente
 │   │   └── main.py        # PUT/GET/DELETE /blocks/{block_id}
 │   ├── tests/
 │   └── requirements.txt
 ├── cli/                   # Cliente de línea de comandos (Mariana)
+│   └── dfsha_cli/distributed.py  # Hito 2: put/get por bloques en paralelo
+├── docs/
+│   └── ESPECIFICACION_HITO2.md   # Protocolos, APIs y diagramas de los 4 flujos
+├── scripts/
+│   └── verify_hito2.py    # Verificación end-to-end contra un clúster levantado
 ├── tests/
 │   ├── conftest.py
 │   ├── test_path_service.py
 │   ├── test_auth.py       # Tests de login/JWT
 │   ├── test_fs.py         # Tests de RF1
 │   ├── test_transfer.py   # Tests de RF2 (Hito 1, monolítico)
-│   └── test_control.py    # Tests de Hito 2: placement, allocate/confirm/blocks
+│   ├── test_control.py    # Hito 2: placement, allocate/confirm/blocks, borrados
+│   └── test_hito2_integracion.py  # Hito 2: convivencia con el Hito 1, migración
 ├── docker-compose.yml     # 1 ControlNode + 3 DataNodes
 ├── requirements.txt
 ├── CONTRATOS.md
@@ -81,13 +93,54 @@ Decisiones de equipo (ver `CONTRATOS.md` para el detalle de cada endpoint):
 - **Transparencia de localización**: el cliente le pide al ControlNode
   (rol NameNode) el plan (`allocate`/`blocks`, con host:puerto de cada
   bloque) y luego habla **directo** con cada DataNode — los bytes nunca
-  pasan por el ControlNode.
+  pasan por el ControlNode. El usuario solo escribe `dfsha put archivo`.
+- **Lecturas sin huecos**: mientras un reemplazo de bloque no se confirma,
+  el plan de lectura sigue sirviendo la versión anterior.
+- **Borrado distribuido vía heartbeat** (como HDFS): `rm`, `rmdir -r`, un
+  re-`allocate` o un reemplazo confirmado encolan el borrado de los
+  bloques viejos (`app/block_gc.py`); cada DataNode recibe la orden en la
+  respuesta de su heartbeat y la acusa en el siguiente. El ControlNode
+  nunca llama a los DataNodes, y un nodo caído recibe sus órdenes al
+  volver.
+- **Seguridad del DataNode**: exige el mismo JWT del login (secreto
+  compartido `DFSHA_JWT_SECRET`) y valida `file_id`/`block_id`, así que no
+  se puede escribir ni borrar fuera de su carpeta.
+- **Integridad**: el cliente manda el SHA-256 de cada bloque
+  (`X-Checksum-Sha256`); el DataNode rechaza lo que no coincide, guarda el
+  checksum y verifica el bloque antes de servirlo, y el cliente lo verifica
+  otra vez al descargar. Todo en streaming.
 
-Levantar el clúster local de prueba (1 ControlNode + 3 DataNodes):
+La especificación de protocolos, con los diagramas de los cuatro flujos y
+el clúster en ejecución, está en
+[`docs/ESPECIFICACION_HITO2.md`](docs/ESPECIFICACION_HITO2.md).
+
+### Levantar el clúster y usarlo
 
 ```bash
-docker compose up --build
+docker compose up --build -d          # 1 ControlNode (:8000) + 3 DataNodes (:8001-8003)
+
+pip install -e ./cli
+dfsha login mariana                   # -u http://localhost:8000 por defecto
+dfsha nodes                           # DataNodes y su estado
+dfsha put video.bin                   # se parte en bloques de 8 MiB
+dfsha get video.bin copia.bin         # baja en paralelo y verifica checksums
+DFSHA_BLOCK_SIZE=65536 dfsha put README.md   # bloques pequeños para la demo
+
+python scripts/verify_hito2.py        # verificación end-to-end automática
+docker compose down                   # (-v para borrar también los datos)
 ```
+
+Sin Docker, cada componente se puede levantar a mano:
+
+```bash
+uvicorn app.main:app --port 8000
+cd datanode && DFSHA_DATANODE_ID=dn1 DFSHA_DATANODE_ADVERTISE_PORT=9001 \
+  DFSHA_DATANODE_STORAGE_DIR=/tmp/dn1 uvicorn app.main:app --port 9001
+```
+
+`dfsha get` sigue pudiendo bajar archivos subidos con el `PUT` monolítico
+del Hito 1. Al arrancar, el ControlNode migra solo la tabla `blocks` de
+las BD de desarrollo creadas antes del reemplazo de bloques.
 
 ## Cómo correrlo
 
@@ -110,13 +163,9 @@ export DFSHA_JWT_SECRET="algo-largo-y-aleatorio"
 ## Tests
 
 ```bash
-pytest tests -q          # suite del servidor (RF1, RF2 y path_service)
-```
-
-La suite de la CLI vive aparte y necesita su propio instalable:
-
-```bash
-pip install -e ./cli && pytest cli/tests -q
+pytest tests -q                                   # ControlNode (RF1, RF2, Hito 2)
+(cd datanode && pip install -r requirements.txt && pytest tests -q)   # DataNode
+pip install -e ./cli && pytest cli/tests -q       # CLI (incluye put/get distribuido)
 ```
 
 ## Autenticación (`app/routers/auth.py`, `app/security.py`)

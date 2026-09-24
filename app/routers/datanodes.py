@@ -5,7 +5,9 @@ Es la cara ControlNode <-> DataNode del sistema. Un DataNode (servicio de
 bloques, implementado aparte en `datanode/`) hace:
 
     1. Al arrancar: POST /datanodes/register con su node_id, host y puerto.
-    2. Periódicamente: POST /datanodes/heartbeat con su node_id.
+    2. Periódicamente: POST /datanodes/heartbeat con su node_id. La
+       respuesta trae las órdenes de borrado de bloques (`delete_blocks`),
+       y el DataNode acusa las ejecutadas en el siguiente (`deleted_blocks`).
 
 El ControlNode con esto mantiene la tabla `datanodes` y sabe qué nodos
 están vivos para repartir bloques (ver app/placement.py).
@@ -24,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.block_gc import acknowledge_and_collect
 from app.database import get_db
 from app.models import DataNode
 from app.placement import is_alive
@@ -97,7 +100,8 @@ def heartbeat(
     payload: HeartbeatRequest,
     db: Session = Depends(get_db),
 ) -> HeartbeatResponse:
-    """Refresca el heartbeat de un DataNode ya registrado.
+    """Refresca el heartbeat de un DataNode ya registrado, procesa el acuse
+    de los bloques que ya borró y le devuelve los que aún debe borrar.
 
     Si el node_id no existe responde 404 `unknown_datanode`: el DataNode
     debe registrarse antes de latir (p. ej. tras un reinicio del ControlNode
@@ -115,12 +119,16 @@ def heartbeat(
 
     node.last_heartbeat = _utcnow()
     node.status = "alive"
+    # RF1 distribuido: el heartbeat es el canal por el que el DataNode se
+    # entera de qué bloques borrar (ver app/block_gc.py).
+    to_delete = acknowledge_and_collect(db, node, payload.deleted_blocks)
     db.commit()
     db.refresh(node)
     return HeartbeatResponse(
         node_id=node.node_id,
         status=DataNodeStatus.ALIVE,
         last_heartbeat=node.last_heartbeat,
+        delete_blocks=to_delete,
     )
 
 

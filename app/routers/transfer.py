@@ -39,6 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.block_gc import discard_blocks
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import File as FileModel
@@ -95,6 +96,26 @@ def _blob_path(file_id: int) -> Path:
 
 def _checksum_path(file_id: int) -> Path:
     return STORAGE_DIR / f"{file_id}.sha256"
+
+
+def delete_local_blobs(file_ids: list[int]) -> None:
+    """Borra del disco local el contenido monolítico (Hito 1) de los
+    archivos indicados: blob, checksum y temporal.
+
+    Llamar DESPUÉS del commit. Los fallos de disco se ignoran a propósito:
+    la transacción ya está confirmada y el namespace es consistente, así que
+    un unlink fallido solo deja un blob huérfano. En Windows es un caso
+    real: una descarga concurrente mantiene el archivo abierto y unlink
+    lanza PermissionError, que sin capturar convertiría un borrado correcto
+    en un error 500.
+    """
+    for file_id in file_ids:
+        blob = _blob_path(file_id)
+        for path in (blob, _checksum_path(file_id), blob.with_suffix(".tmp")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _read_checksum(file_id: int) -> str | None:
@@ -190,6 +211,10 @@ async def put_file(
     tmp_path.replace(blob_path)
     _checksum_path(file_row.id).write_text(hasher.hexdigest())
 
+    # Si el archivo estaba repartido en bloques (Hito 2), el contenido pasa a
+    # ser este blob: sus bloques salen del namespace y se encola su borrado
+    # en los DataNodes.
+    discard_blocks(db, file_row.blocks)
     file_row.size_bytes = size
     db.commit()
     db.refresh(file_row)
@@ -213,6 +238,20 @@ async def get_file(
         raise _http_error(exc) from exc
 
     blob_path = _blob_path(file_row.id)
+    if not blob_path.exists() and file_row.blocks:
+        # Archivo del DFS distribuido (Hito 2): su contenido vive en bloques
+        # repartidos entre DataNodes y el ControlNode nunca lo toca. El
+        # cliente debe pedir el plan de lectura y bajar los bloques directo.
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorResponse(
+                error="distributed_file",
+                message=(
+                    f"{path} está repartido en bloques entre DataNodes: pide el plan "
+                    f"con GET /files{path}/blocks y descarga cada bloque de su DataNode"
+                ),
+            ).model_dump(),
+        )
     if not blob_path.exists():
         # Caso de inconsistencia: hay metadata en la BD pero no contenido
         # en disco (no debería pasar en operación normal).

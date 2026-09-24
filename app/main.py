@@ -2,9 +2,10 @@
 Punto de entrada de la aplicación FastAPI.
 
 Este archivo SOLO se encarga de:
-- Crear las tablas (create_all) y sembrar el directorio raíz al arrancar.
+- Crear las tablas (create_all), migrar las de versiones anteriores y
+  sembrar el directorio raíz al arrancar.
 - Exponer /health.
-- Registrar los routers de mis compañeros (comentado por ahora, ver abajo).
+- Registrar los routers (ver abajo; el orden de /files importa).
 
 Los endpoints de negocio (ls/mkdir/rmdir/rm, put/get) NO se implementan
 aquí: cada compañero debe crear su propio `APIRouter` en un módulo nuevo
@@ -17,13 +18,42 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import Engine, inspect, select, text
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
-from app.models import User
+from app.models import BLOCKS_UNIQUE_CONSTRAINT, Block, User
 from app.path_service import get_or_create_root
 from app.schemas import ErrorResponse
+
+
+def _migrate_blocks_table(bind: Engine) -> None:
+    """Migra la tabla `blocks` de BD creadas antes del reemplazo de bloques.
+
+    La unicidad pasó de (file_id, block_index) a (file_id, block_index,
+    committed) para que un reemplazo pendiente conviva con el bloque
+    confirmado que sigue sirviéndose (ver app/models.py). `create_all` no
+    altera tablas existentes y SQLite no permite cambiar una restricción en
+    sitio, así que se reconstruye la tabla conservando las filas.
+    """
+    inspector = inspect(bind)
+    if "blocks" not in inspector.get_table_names():
+        return
+    names = {uc["name"] for uc in inspector.get_unique_constraints("blocks")}
+    if BLOCKS_UNIQUE_CONSTRAINT in names:
+        return
+
+    columns = ", ".join(column.name for column in Block.__table__.columns)
+    # Los índices conservan su nombre tras el RENAME: hay que soltarlos para
+    # que create() pueda volver a crearlos sobre la tabla nueva.
+    index_names = [index["name"] for index in inspector.get_indexes("blocks")]
+    with bind.begin() as conn:
+        conn.execute(text("ALTER TABLE blocks RENAME TO blocks_old"))
+        for name in index_names:
+            conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+        Block.__table__.create(conn)
+        conn.execute(text(f"INSERT INTO blocks ({columns}) SELECT {columns} FROM blocks_old"))
+        conn.execute(text("DROP TABLE blocks_old"))
 
 
 def _seed_root_directory() -> None:
@@ -34,6 +64,7 @@ def _seed_root_directory() -> None:
     Se ejecuta una sola vez al arrancar el servidor.
     """
     Base.metadata.create_all(bind=engine)
+    _migrate_blocks_table(engine)
 
     db = SessionLocal()
     try:
@@ -58,8 +89,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    description="DFS por bloques tipo HDFS — Hito 1 (monolítico cliente/servidor)",
-    version="0.1.0",
+    description=(
+        "ControlNode del DFS por bloques tipo HDFS — Hito 2: namespace, "
+        "placement de bloques y registro de DataNodes"
+    ),
+    version="0.2.0",
     lifespan=lifespan,
 )
 

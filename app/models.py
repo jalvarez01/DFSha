@@ -195,6 +195,12 @@ class DataNode(Base):
         return f"<DataNode node_id={self.node_id!r} {self.host}:{self.port} status={self.status}>"
 
 
+# Nombre de la restricción de unicidad de `blocks`. Versiones anteriores
+# usaban "uq_block_file_index" (file_id, block_index); app/main.py migra las
+# BD de desarrollo que todavía la tengan (ver _migrate_blocks_table).
+BLOCKS_UNIQUE_CONSTRAINT = "uq_block_file_index_state"
+
+
 class Block(Base):
     """Un bloque de un archivo, almacenado en un DataNode concreto.
 
@@ -216,11 +222,18 @@ class Block(Base):
       checksum real y marca `committed=True`.
     El plan de lectura (`GET .../blocks`) devuelve solo los bloques ya
     confirmados, que son los que de verdad se pueden descargar.
+
+    Reemplazo de un bloque (`POST .../blocks/{index}/allocate`): mientras el
+    reemplazo no se confirma, conviven DOS filas con el mismo índice, la
+    vieja confirmada (la que se sigue leyendo) y la nueva pendiente. Por eso
+    la unicidad es por (file_id, block_index, committed): como mucho una
+    confirmada y una pendiente por índice. Al confirmar la nueva, `confirm`
+    borra la vieja y encola su borrado en el DataNode (PendingDeletion).
     """
 
     __tablename__ = "blocks"
     __table_args__ = (
-        UniqueConstraint("file_id", "block_index", name="uq_block_file_index"),
+        UniqueConstraint("file_id", "block_index", "committed", name=BLOCKS_UNIQUE_CONSTRAINT),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -248,3 +261,39 @@ class Block(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Block block_id={self.block_id!r} file_id={self.file_id} idx={self.block_index}>"
+
+
+class PendingDeletion(Base):
+    """Bloque que un DataNode debe borrar de su disco.
+
+    Cuando el namespace deja de referenciar un bloque (rm, rmdir -r,
+    re-allocate, reemplazo de un bloque, PUT heredado sobre un archivo
+    distribuido), su fila en `blocks` se borra en la MISMA transacción en la
+    que se encola aquí la orden de borrado físico. El ControlNode no llama
+    al DataNode: igual que el NameNode de HDFS, entrega las órdenes en la
+    respuesta del heartbeat (`delete_blocks`), y el DataNode acusa recibo en
+    el heartbeat siguiente (`deleted_blocks`), momento en que la fila se
+    elimina. Entrega al-menos-una-vez: borrar un bloque es idempotente.
+
+    Así el borrado distribuido no depende de que el ControlNode alcance al
+    DataNode por red (en docker-compose el host que se anuncia a los
+    clientes no tiene por qué ser alcanzable desde el ControlNode) y
+    sobrevive a DataNodes caídos: la orden espera hasta que el nodo vuelva.
+    """
+
+    __tablename__ = "pending_deletions"
+    __table_args__ = (
+        UniqueConstraint("datanode_id", "block_id", name="uq_pending_deletion"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    datanode_id: Mapped[int] = mapped_column(
+        ForeignKey("datanodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    block_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Sin FK: el archivo normalmente ya no existe cuando el DataNode borra.
+    file_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<PendingDeletion block_id={self.block_id!r} datanode_id={self.datanode_id}>"

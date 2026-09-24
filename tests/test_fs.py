@@ -30,9 +30,9 @@ from app.routers import transfer as transfer_module
 
 @pytest.fixture()
 def client(db, tmp_path, monkeypatch):
-    # Los blobs de estos tests van a un directorio temporal. fs.py usa las
-    # funciones _blob_path/_checksum_path de transfer, que leen este global en
-    # tiempo de llamada, así que el parche también aplica al borrado.
+    # Los blobs de estos tests van a un directorio temporal. fs.py usa la
+    # función delete_local_blobs de transfer, que lee este global en tiempo
+    # de llamada, así que el parche también aplica al borrado.
     monkeypatch.setattr(transfer_module, "STORAGE_DIR", tmp_path)
 
     app = FastAPI()
@@ -404,9 +404,14 @@ def test_put_into_directory_created_with_mkdir(client):
     ]
 
 
-def test_fs_router_imports_transfer_storage_helpers():
-    """fs.py depende de _blob_path/_checksum_path de transfer.py. Si allí se
-    renombran, el import falla y se cae la app entera al arrancar; este test
-    lo detecta en la suite en vez de en producción."""
-    assert fs_module._blob_path(7) == transfer_module.STORAGE_DIR / "7"
-    assert fs_module._checksum_path(7) == transfer_module.STORAGE_DIR / "7.sha256"
+def test_fs_router_imports_transfer_storage_helpers(tmp_path, monkeypatch):
+    """fs.py depende de delete_local_blobs de transfer.py. Si allí se
+    renombra, el import falla y se cae la app entera al arrancar; este test
+    lo detecta en la suite en vez de en producción. También comprueba que
+    respeta el STORAGE_DIR parcheado (lo lee en tiempo de llamada)."""
+    monkeypatch.setattr(transfer_module, "STORAGE_DIR", tmp_path)
+    (tmp_path / "7").write_bytes(b"x")
+    (tmp_path / "7.sha256").write_text("abc")
+    fs_module.delete_local_blobs([7])
+    assert not (tmp_path / "7").exists()
+    assert not (tmp_path / "7.sha256").exists()

@@ -4,19 +4,15 @@ Cliente HTTP hacia la API de DFSha.
 Traduce los errores del servidor (forma `ErrorResponse` de
 CONTRATOS.md/schemas.py: {"error": "...", "message": "..."}) a
 excepciones Python legibles, y distingue un caso particular importante
-en el estado actual del proyecto:
+cuando el servidor no tiene registrada una ruta:
 
-    Los endpoints /fs/* (ls, mkdir, rmdir, rm) todavía NO están
-    registrados en app/main.py (el compañero de FS no ha terminado su
-    parte). Si se llama a uno de esos endpoints hoy, FastAPI responde
-    404 con el cuerpo por defecto `{"detail": "Not Found"}` (un string),
-    que es distinguible del 404 "de negocio" que sí define el contrato
+    Un 404 de FastAPI sin ruta registrada trae el cuerpo por defecto
+    `{"detail": "Not Found"}` (un string), distinguible del 404 "de
+    negocio" que define el contrato
     (`{"detail": {"error": "not_found", "message": "..."}}`, un dict).
-
-    Este cliente detecta esa diferencia y levanta `RouteNotImplemented`
-    en el primer caso, con un mensaje claro de "esto todavía no existe
-    en el servidor", en vez de confundir al usuario con un genérico
-    "no encontrado" como si su ruta remota no existiera.
+    Este cliente levanta `RouteNotImplemented` en el primer caso (p. ej. un
+    servidor viejo sin los endpoints del Hito 2) en vez de confundir al
+    usuario con un "no encontrado" como si su ruta remota no existiera.
 """
 from __future__ import annotations
 
@@ -149,7 +145,9 @@ class DFShaClient:
         resp = self._request("DELETE", "/fs/rm", json={"path": path})
         return resp.json()
 
-    # -- RF2: transferencia (contrato /files/*, Paulina) ---------------
+    # -- RF2 del Hito 1: transferencia monolítica a través del servidor.
+    # La CLI usa ahora la versión distribuida (dfsha_cli/distributed.py);
+    # get_file se conserva para archivos subidos con el PUT del Hito 1.
     def put_file(
         self,
         remote_path: str,
@@ -215,6 +213,35 @@ class DFShaClient:
             "checksum_sha256": checksum,
             "size_bytes": int(content_length) if content_length else None,
         }
+
+    # -- Hito 2: ControlNode (plan de bloques y DataNodes) -------------
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        """Headers de autenticación, para propagar el JWT a los DataNodes."""
+        return dict(self._headers)
+
+    def allocate(self, path: str, size_bytes: int, block_size: int | None = None) -> dict:
+        """Fase 1 de la escritura: plan de qué bloque va a qué DataNode."""
+        resp = self._request(
+            "POST",
+            f"/files{path}/allocate",
+            json={"size_bytes": size_bytes, "block_size": block_size},
+        )
+        return resp.json()
+
+    def confirm(self, path: str, blocks: list[dict]) -> dict:
+        """Fase 2 de la escritura: checksums y tamaños de lo subido."""
+        resp = self._request("POST", f"/files{path}/confirm", json={"blocks": blocks})
+        return resp.json()
+
+    def blocks(self, path: str) -> dict:
+        """Plan de lectura: de qué DataNode bajar cada bloque."""
+        resp = self._request("GET", f"/files{path}/blocks")
+        return resp.json()
+
+    def datanodes(self) -> list[dict]:
+        resp = self._request("GET", "/datanodes")
+        return resp.json()
 
     def health(self) -> dict:
         resp = self._request("GET", "/health")

@@ -39,6 +39,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.block_gc import discard_blocks
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user
@@ -64,6 +65,7 @@ from app.placement import (
     new_block_id,
     plan_partition,
 )
+from app.routers.transfer import delete_local_blobs
 from app.schemas import (
     AllocatedBlock,
     AllocateRequest,
@@ -128,12 +130,13 @@ def allocate_block(
     final del archivo, SIN tocar los demás bloques ni descartar el resto
     del plan (a diferencia de `allocate`, que reemplaza todo el archivo).
 
-    - `index < len(blocks)`: reemplaza ese bloque. Se descarta la fila
-      vieja (su contenido en el DataNode anterior queda huérfano, igual que
-      en el re-allocate completo de `allocate`) y se crea una nueva con
-      `block_id` nuevo, posiblemente en otro DataNode.
-    - `index == len(blocks)`: anexa un bloque nuevo al final (crecer el
-      archivo). No se permite dejar huecos: `index > len(blocks)` es
+    - `index < número de bloques`: reemplaza ese bloque. La fila nueva
+      queda pendiente (`committed=False`) y la vieja SIGUE confirmada y
+      visible en el plan de lectura hasta que `confirm` confirme la nueva:
+      un lector concurrente nunca ve un archivo con un hueco. Si ya había
+      un reemplazo pendiente para ese índice, se descarta.
+    - `index == número de bloques`: anexa un bloque nuevo al final (crecer
+      el archivo). No se permite dejar huecos: un índice mayor es
       `400 invalid_block_index`.
 
     IMPORTANTE sobre el enrutado: esta ruta se registra ANTES que
@@ -154,16 +157,18 @@ def allocate_block(
     except PathError as exc:
         raise _http_error(exc) from exc
 
-    current = list(file_row.blocks)  # ya vienen ordenados por block_index
-    if index < 0 or index > len(current):
+    # Número de bloques = índices distintos (un índice puede tener una fila
+    # confirmada y otra pendiente a la vez, ver el modelo Block).
+    num_indexes = len({block.block_index for block in file_row.blocks})
+    if index < 0 or index > num_indexes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ErrorResponse(
                 error="invalid_block_index",
                 message=(
                     f"Índice de bloque {index} inválido para {path} "
-                    f"(el archivo tiene {len(current)} bloque(s); solo se puede "
-                    f"reemplazar 0..{len(current) - 1} o anexar en {len(current)})"
+                    f"(el archivo tiene {num_indexes} bloque(s); solo se puede "
+                    f"reemplazar 0..{num_indexes - 1} o anexar en {num_indexes})"
                 ),
             ).model_dump(),
         )
@@ -177,9 +182,8 @@ def allocate_block(
             detail=ErrorResponse(error="no_datanodes", message=str(exc)).model_dump(),
         ) from exc
 
-    if index < len(current):
-        db.delete(current[index])
-        db.flush()
+    stale_pending = [b for b in file_row.blocks if b.block_index == index and not b.committed]
+    discard_blocks(db, stale_pending)
 
     block_id = new_block_id()
     db.add(
@@ -244,14 +248,13 @@ def allocate(
         ) from exc
 
     existing = find_child_file(db, parent.id, leaf_name)
+    replaced_legacy_blob = False
     if existing is not None:
         file_row = existing
-        # Reasignar: descartar el plan anterior. El borrado del contenido de
-        # los bloques viejos en los DataNodes es tarea del RF1 distribuido;
-        # aquí limpiamos los metadatos para no dejar bloques huérfanos.
-        for old_block in list(file_row.blocks):
-            db.delete(old_block)
-        db.flush()
+        # Reasignar: descartar el plan anterior. discard_blocks borra los
+        # metadatos y encola el borrado físico en los DataNodes.
+        discard_blocks(db, file_row.blocks)
+        replaced_legacy_blob = True
     else:
         file_row = FileModel(name=leaf_name, parent_id=parent.id, owner_id=user.id, size_bytes=0)
         db.add(file_row)
@@ -284,6 +287,10 @@ def allocate(
     file_row.size_bytes = payload.size_bytes
     db.commit()
     db.refresh(file_row)
+    if replaced_legacy_blob:
+        # Si el archivo venía del PUT monolítico del Hito 1, su blob local
+        # ya no representa el contenido: se borra tras el commit.
+        delete_local_blobs([file_row.id])
 
     return AllocateResponse(
         path=_full_path(db, file_row),
@@ -325,15 +332,28 @@ def confirm(
                     message=f"El bloque {confirmation.block_id!r} no pertenece a {path}",
                 ).model_dump(),
             )
+        if not block.committed:
+            # Si este bloque reemplaza a otro ya confirmado en el mismo
+            # índice, el viejo sale del namespace ahora (y se encola su
+            # borrado en el DataNode). Se hace flush antes de marcar el
+            # nuevo para no violar la unicidad (file_id, índice, committed).
+            superseded = [
+                other
+                for other in file_row.blocks
+                if other.block_index == block.block_index and other.committed
+            ]
+            discard_blocks(db, superseded)
         block.checksum = confirmation.checksum
         block.size_bytes = confirmation.size_bytes
         block.committed = True
+        db.flush()
+        db.expire(file_row, ["blocks"])  # recargar sin las filas descartadas
 
     committed = [block for block in file_row.blocks if block.committed]
     file_row.size_bytes = sum(block.size_bytes for block in committed)
-    # "Completo" = todos los bloques planificados quedaron confirmados. Un
+    # "Completo" = no queda ningún bloque planificado sin confirmar. Un
     # archivo vacío (0 bloques) también cuenta como completo.
-    complete = len(committed) == len(file_row.blocks)
+    complete = all(block.committed for block in file_row.blocks)
 
     db.commit()
     db.refresh(file_row)

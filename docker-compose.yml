@@ -6,30 +6,38 @@
 #   - controlnode : esta app FastAPI en su rol de NameNode/HDFS. Guarda solo
 #                   metadatos (namespace + tabla de bloques) y decide el
 #                   placement. Es el único con estado en SQLite.
-#   - datanode-1..3 : servicios de bloques (carpeta ./datanode, a cargo de
-#                   Jacobo). Cada uno se registra y late contra el
-#                   ControlNode y almacena los bloques que le asignen.
+#   - datanode-1..3 : servicios de bloques (carpeta ./datanode). Cada uno se
+#                   registra y late contra el ControlNode, almacena los
+#                   bloques que le asignen y valida el JWT de los clientes.
+#
+# Uso:
+#   docker compose up --build -d
+#   dfsha login <usuario> -u http://localhost:8000
+#   dfsha put archivo.bin && dfsha get archivo.bin copia.bin
+#   python scripts/verify_hito2.py            # verificación end-to-end
 #
 # Para escalar el número de DataNodes basta con copiar un bloque `datanode-N`
 # (cada uno con su node_id, su puerto y su volumen). Se dejan 3 como ejemplo.
 #
 # --- Contrato ControlNode <-> DataNode -------------------------------------
-# El servicio ./datanode DEBE leer estas variables de entorno y, al arrancar,
-# hacer `POST {DFSHA_CONTROLNODE_URL}/datanodes/register` con:
+# Cada DataNode lee estas variables de entorno y, al arrancar, hace
+# `POST {DFSHA_CONTROLNODE_URL}/datanodes/register` con:
 #     { "node_id": DFSHA_DATANODE_ID,
 #       "host":    DFSHA_DATANODE_ADVERTISE_HOST,
 #       "port":    DFSHA_DATANODE_ADVERTISE_PORT }
-# y luego `POST /datanodes/heartbeat` con { "node_id": ... } cada
-# DFSHA_HEARTBEAT_INTERVAL segundos (holgadamente < heartbeat_ttl del
-# ControlNode, 30 s por defecto). `host`/`port` son la dirección con la que
-# el CLIENTE alcanza al DataNode para subir/bajar bloques.
+# y luego `POST /datanodes/heartbeat` cada DFSHA_HEARTBEAT_INTERVAL segundos
+# (holgadamente < heartbeat_ttl del ControlNode, 30 s por defecto). La
+# respuesta del heartbeat trae las órdenes de borrado de bloques; el
+# ControlNode NUNCA llama al DataNode, así que no necesita alcanzarlo.
 #
-# NOTA sobre `host`: aquí se anuncia el nombre de servicio de Docker
-# (datanode-1, etc.), válido para un cliente que corra DENTRO de la red del
-# compose. Si el cliente corre en la máquina anfitriona, cambia
-# DFSHA_DATANODE_ADVERTISE_HOST a una dirección alcanzable desde el host
-# (p. ej. host.docker.internal o la IP de la VM) — por eso además se publican
-# los puertos de cada DataNode al host.
+# `host`/`port` son la dirección con la que el CLIENTE alcanza al DataNode
+# para subir/bajar bloques. Se anuncia `localhost` y cada DataNode publica
+# su puerto en el host (8001..8003), así que la CLI corriendo en la máquina
+# anfitriona funciona sin configurar nada. Para un cliente en OTRA máquina,
+# cambia DFSHA_DATANODE_ADVERTISE_HOST por la IP/nombre del anfitrión.
+#
+# DFSHA_JWT_SECRET debe ser el MISMO en el ControlNode y en los DataNodes:
+# el DataNode valida con él los tokens que emite el ControlNode.
 
 services:
   controlnode:
@@ -58,7 +66,7 @@ services:
       retries: 5
 
   datanode-1:
-    build: ./datanode          # servicio de bloques (Jacobo)
+    build: ./datanode
     image: dfsha-datanode:hito2
     container_name: dfsha-datanode-1
     depends_on:
@@ -67,7 +75,7 @@ services:
     environment:
       DFSHA_DATANODE_ID: "datanode-1"
       DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-1"
+      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8001"
       DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
       DFSHA_HEARTBEAT_INTERVAL: "10"
@@ -89,7 +97,7 @@ services:
     environment:
       DFSHA_DATANODE_ID: "datanode-2"
       DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-2"
+      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8002"
       DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
       DFSHA_HEARTBEAT_INTERVAL: "10"
@@ -111,7 +119,7 @@ services:
     environment:
       DFSHA_DATANODE_ID: "datanode-3"
       DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "datanode-3"
+      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8003"
       DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
       DFSHA_HEARTBEAT_INTERVAL: "10"
