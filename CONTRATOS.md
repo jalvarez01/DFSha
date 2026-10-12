@@ -1,4 +1,4 @@
-# Contratos de API — DFSha (Hitos 1 y 2)
+# Contratos de API — DFSha (Hitos 1, 2 y 3)
 
 Este documento fija la firma exacta de los endpoints que **no** implemento
 yo, para que cada compañero pueda empezar a codear en paralelo sin
@@ -30,6 +30,22 @@ ningún header de autenticación), `401 invalid_token` (JWT inválido o
 expirado), `401 invalid_credentials` (login fallido) y `422 validation_error` (cuerpo de
 request malformado; un manejador en `app/main.py` lo reescribe al formato
 `ErrorResponse` en vez del `detail` en forma de lista que trae FastAPI).
+
+Desde el Hito 3 (ver la sección "Hito 3" al final):
+
+| HTTP | `error` | Cuándo |
+|---|---|---|
+| 401 | `otp_required`, `invalid_otp` | login de un usuario con 2FA |
+| 401 | `invalid_api_key` | API key inválida, revocada o expirada |
+| 401 | `invalid_node_token` | `/datanodes/*` o `/ha/*` sin token de nodo válido |
+| 403 | `permission_denied` | el usuario no tiene permiso (app/acl.py) |
+| 403 | `session_required` | operación sensible hecha con API key |
+| 403 | `node_mismatch` | un DataNode habla en nombre de otro |
+| 409 | `file_locked`, `invalid_lease` | locks y leases de escritura |
+| 409 | `replicas_not_ready` | `confirm` sin informes de los DataNodes que lo respalden |
+| 410 | `snapshot_required` | `/ha/log`: el respaldo debe pedir un snapshot |
+| 429 | `too_many_attempts` | bloqueo por logins fallidos |
+| 503 | `not_leader` | petición a un ControlNode respaldo (header `X-DFSha-Leader`) |
 
 El cuerpo de cualquier error debe tener la forma de `ErrorResponse`
 (`{"error": "...", "message": "..."}"`), típicamente vía:
@@ -273,8 +289,9 @@ flujos, está en [`docs/ESPECIFICACION_HITO2.md`](docs/ESPECIFICACION_HITO2.md).
 
 ## 4. DataNode ↔ ControlNode — `app/routers/datanodes.py` (prefix `/datanodes`)
 
-**Sin autenticación de usuario** (tráfico interno nodo↔control; el
-aseguramiento nodo-a-nodo es del Hito 3).
+**Sin autenticación de usuario** (tráfico interno nodo↔control). Desde el
+Hito 3 exigen un **token de nodo** y hay campos y endpoints nuevos: ver
+§H3.4.
 
 ### `POST /datanodes/register`
 
@@ -317,6 +334,10 @@ Lista los DataNodes conocidos con su liveness **calculada** al momento
 a un intervalo holgadamente menor (p. ej. 10 s).
 
 ## 5. Cliente ↔ ControlNode — `app/routers/control.py` (prefix `/files`)
+
+> **Hito 3:** allocate devuelve una cadena de réplica y un token por bloque,
+> confirm exige informes de los DataNodes, blocks devuelve todas las
+> réplicas, y todo comprueba permisos y locks. Ver §H3.3.
 
 **Requieren autenticación** (`get_current_user`), igual que el resto de la
 API de archivos. Traducen las excepciones de `path_service` con la misma
@@ -404,8 +425,13 @@ Devuelve, en orden por `index`, de qué DataNode bajar cada bloque
 
 ## 6. Servicio DataNode — `datanode/`
 
-Servicio FastAPI independiente del ControlNode. Todos los endpoints salvo
-`/health` exigen `Authorization: Bearer <jwt>` (el token de
+> **Hito 3:** el DataNode ya no valida el JWT del usuario sino un token de
+> bloque firmado por el ControlNode; además reenvía por la cadena de réplica,
+> cifra en reposo y no permite sobrescribir un bloque. Ver §H3.5. Lo que
+> sigue describe el Hito 2.
+
+Servicio FastAPI independiente del ControlNode. En el Hito 2, todos los
+endpoints salvo `/health` exigían `Authorization: Bearer <jwt>` (el token de
 `POST /auth/login` del ControlNode, validado con `DFSHA_JWT_SECRET`):
 `401 unauthenticated` si falta, `401 invalid_token` si la firma no cuadra o
 expiró.
@@ -455,12 +481,166 @@ Hito 1 (sin bloques) se descarga por el `GET` monolítico.
 `GET /files/{path}` del Hito 1 sobre un archivo distribuido responde
 `409 distributed_file` (el ControlNode no tiene su contenido).
 
-## Infraestructura
+## Infraestructura (Hito 2)
 
-`docker-compose.yml` (raíz) levanta 1 ControlNode y 3 DataNodes en la red
-`dfsha_net`. Cada DataNode anuncia `localhost:<su puerto>` (8001–8003,
-publicados en el host) para que la CLI de la máquina anfitriona los
-alcance. Todos comparten `DFSHA_JWT_SECRET`.
+`docker-compose.yml` levantaba 1 ControlNode y 3 DataNodes. En el Hito 3 son
+2 ControlNodes y 4 DataNodes con TLS: ver §H3.8.
+
+---
+
+# Hito 3 — Alta disponibilidad, replicación, consistencia y seguridad
+
+Diseño, diagramas y razones en
+[`docs/ESPECIFICACION_HITO3.md`](docs/ESPECIFICACION_HITO3.md). Aquí, las
+firmas.
+
+## H3.1 Autenticación — `app/routers/auth.py` (prefix `/auth`)
+
+- `POST /auth/login`: body `{"username", "password", "otp"?}`. Si el usuario
+  tiene 2FA y falta `otp`: `401 otp_required`; si el código es incorrecto o
+  ya se usó: `401 invalid_otp`. Tras `max_login_failures` (5) fallos
+  seguidos: `429 too_many_attempts` durante `login_lockout_seconds` (300).
+  `system` y `replicator` nunca pueden iniciar sesión.
+- `GET /auth/2fa` → `{"username", "enabled"}`.
+- `POST /auth/2fa/setup` → `{"secret", "otpauth_uri"}` (`409 2fa_already_enabled`).
+- `POST /auth/2fa/enable` / `POST /auth/2fa/disable`: body `{"code"}` →
+  `{"username", "enabled"}` (`400 invalid_otp`).
+- `POST /auth/api-keys`: body `{"name", "expires_in_days"?}` → `201`
+  `{"id", "name", "prefix", "key", "created_at", "expires_at", ...}`. `key`
+  solo se devuelve aquí.
+- `GET /auth/api-keys` → lista sin la clave. `DELETE /auth/api-keys/{id}` → revoca.
+- Crear API keys y gestionar 2FA exige sesión con contraseña:
+  `403 session_required` si se usa una API key.
+
+Formas de autenticarse en el resto de la API (en este orden): `X-API-Key:
+dfsha_...` o `Authorization: Bearer dfsha_...`; `Authorization: Bearer
+<jwt>`; `X-Username` solo con `DFSHA_ALLOW_INSECURE_DEV_AUTH=true`.
+
+## H3.2 Permisos y grupos — `app/routers/fs.py`, `app/routers/groups.py`
+
+Todos los endpoints de `/fs` y `/files` comprueban permisos (app/acl.py);
+sin permiso responden `403 permission_denied`. `ls` y `stat` devuelven
+además `owner`, `group` y `mode` (`"drwxr-x---"`, con `+` si hay ACL;
+`stat` también `mode_octal`).
+
+- `POST /fs/chmod`: `{"path", "mode": "750"}` → `AclResponse`. Solo el dueño.
+- `POST /fs/chgrp`: `{"path", "group": str | null}` → `AclResponse`. Dueño y miembro del grupo.
+- `GET /fs/acl?path=` → `AclResponse`: `{"path", "owner", "group", "mode",
+  "mode_octal", "entries": [{"type": "user"|"group", "name", "perms": "r-x"}]}`.
+- `POST /fs/acl`: `{"path", "type", "name", "perms"}` añade o cambia una entrada. Solo el dueño.
+- `DELETE /fs/acl`: `{"path", "type", "name"}` la quita. Solo el dueño.
+- `POST /groups`: `{"name"}` → `201 GroupResponse` (`{"name", "owner",
+  "members", "created_at"}`); quien lo crea es dueño y miembro. `409 already_exists`.
+- `GET /groups` → grupos del usuario. `GET /groups/{name}`.
+- `POST /groups/{name}/members`: `{"username"}`; `DELETE /groups/{name}/members/{username}`;
+  `DELETE /groups/{name}` → `204`. Solo el dueño del grupo.
+
+## H3.3 Cliente ↔ ControlNode: bloques y locks — `app/routers/control.py`
+
+- `POST /files/{path}/allocate`: body `{"size_bytes", "block_size"?,
+  "lease_id"?}`. Exige `w` sobre el archivo (o `w+x` en el padre si es
+  nuevo). Toma un lease exclusivo (`409 file_locked` si otro lo tiene).
+  Respuesta: `{"path", "file_id", "block_size", "total_size", "lease_id",
+  "replication", "blocks": [{"index", "block_id", "file_id", "size_bytes",
+  "datanode", "datanodes": [DataNodeLocation], "token", "lease_id"}]}`.
+  `DataNodeLocation` = `{"node_id", "host", "port", "scheme"}` (dirección
+  pública). El cliente sube a `datanodes[0]` con `Authorization: Bearer
+  <token>`; si no responde, prueba el siguiente.
+- `POST /files/{path}/blocks/{index}/allocate`: body `{"size_bytes",
+  "lease_id"?}` → un `AllocatedBlock` (con cadena y token).
+- `POST /files/{path}/confirm`: body `{"blocks": [{"block_id", "checksum",
+  "size_bytes"}], "lease_id"?}`. Un bloque se confirma solo si al menos
+  `min_replicas` DataNodes informaron ese checksum y tamaño; si no, `409
+  replicas_not_ready` sin cambiar nada (reintentable). Libera el lease
+  implícito al completar.
+- `GET /files/{path}/blocks`: exige `r`. Cada bloque trae `datanodes` (réplicas
+  `stored`, vivas primero) y un `token` de lectura.
+- `POST /files/{path}/lock`: `{"mode": "exclusive"|"shared", "ttl_seconds"?}`
+  → `201 LockResponse` (`{"lock_id", "path", "mode", "owner", "expires_at",
+  "implicit"}`). `exclusive` exige `w`; `shared`, `r`. `409 file_locked` si choca.
+- `POST /files/{path}/lock/{lock_id}/renew`: `{"ttl_seconds"?}`;
+  `DELETE /files/{path}/lock/{lock_id}`; `GET /files/{path}/locks`.
+  Un lock ajeno, vencido o de otro archivo: `409 invalid_lease`.
+- `rm` y `rmdir -r` de un archivo bloqueado por otro usuario: `409 file_locked`.
+- `GET /cluster/status` → `{"controlnode": {"controlnode_id", "role",
+  "epoch", "leader_id", "applied_seq", "peers"}, "replication_factor",
+  "datanodes": [{"node_id", "address", "status", "blocks"}], "files",
+  "blocks", "under_replicated", "missing", "pending_replications",
+  "pending_deletions"}`.
+
+## H3.4 ControlNode ↔ DataNode — `app/routers/datanodes.py`
+
+Todos exigen `Authorization: Bearer <token de nodo>` (firmado con
+`DFSHA_CLUSTER_SECRET`, `typ=node`, `role=datanode`) cuyo `sub` sea el
+`node_id` del cuerpo (`401 invalid_node_token`, `403 node_mismatch`).
+
+- `POST /datanodes/register`: `{"node_id", "host", "port", "scheme",
+  "internal_host"?, "internal_port"?}`. Solo en el líder.
+- `POST /datanodes/heartbeat`: `{"node_id", "deleted_blocks": [str],
+  "received_blocks": [ReceivedBlock], "corrupt_blocks": [str],
+  "controlnodes": {controlnode_id: segundos_sin_contacto}}` → `{"node_id",
+  "status", "last_heartbeat", "role", "epoch", "controlnode_id",
+  "delete_blocks": [str], "replicate": [{"block_id", "file_id", "token",
+  "targets": [DataNodeLocation interna]}]}`. Se manda a TODOS los
+  ControlNodes; un respaldo solo anota el testigo y responde sin órdenes.
+- `POST /datanodes/blocks/received`: `{"node_id", "blocks": [{"block_id",
+  "checksum", "size_bytes"}]}` → `204`. Marca la réplica como `stored`.
+- `POST /datanodes/block-report`: `{"node_id", "blocks": [...]}` → `{"known",
+  "added", "lost", "orphans"}`.
+- `GET /datanodes`: ahora exige usuario autenticado.
+
+## H3.5 DataNode — `datanode/`
+
+- `PUT /blocks/{block_id}?file_id=`: exige un token de bloque `op=write`
+  del mismo bloque y archivo, con este DataNode dentro de `pipe` (`401`/`403`).
+  `X-Checksum-Sha256` opcional (`400 checksum_mismatch`). Un bloque ya
+  guardado con otro contenido: `409 block_exists`; con el mismo, no-op.
+  Tras guardar, informa al líder (`/datanodes/blocks/received`) y reenvía
+  al siguiente nodo de `pipe`. Respuesta: `{"block_id", "file_id",
+  "size_bytes", "checksum", "stored_on": [node_id], "failed": [node_id]}`.
+- `GET /blocks/{block_id}`: exige token `op=read` del mismo bloque.
+- `DELETE /blocks/{block_id}`, `DELETE /files/{file_id}/blocks`: exigen un
+  token de nodo con `role=controlnode` (administración).
+- Con `DFSHA_DATANODE_STORAGE_KEY`, los bloques se guardan cifrados con
+  AES-256-GCM; los escritos antes sin cifrar se siguen leyendo.
+- Variables nuevas: `CONTROLNODE_URLS`, `DATANODE_INTERNAL_HOST/PORT`,
+  `CLUSTER_SECRET`, `DATANODE_STORAGE_KEY`, `TLS_CERT`, `TLS_KEY`, `CA_CERT`,
+  `BLOCK_REPORT_INTERVAL`. `JWT_SECRET` ya no se usa.
+
+## H3.6 ControlNode ↔ ControlNode — `app/ha/router.py` (prefix `/ha`)
+
+- `GET /ha/status` (público) → `{"controlnode_id", "role": "leader"|"standby",
+  "epoch", "leader_id", "applied_seq", "public_url", "ha_enabled"}`.
+- `GET /ha/log?since=N&wait=S` (token de nodo `role=controlnode`): long-poll,
+  entradas con `seq > N` → `{"epoch", "leader_id", "last_seq", "entries":
+  [{"seq", "epoch", "table", "op": "upsert"|"delete"|"snapshot", "row"}]}`.
+  `since` es el acuse del respaldo. `409 not_leader` en un respaldo; `410
+  snapshot_required` si el log ya se podó o el respaldo va por delante.
+- `GET /ha/snapshot` (token de ControlNode) → `{"seq", "epoch", "leader_id",
+  "tables": {nombre: [filas]}}`.
+- Un respaldo responde `503 not_leader` a todo lo demás, salvo `/health`,
+  `/ha/*` y `/datanodes/heartbeat`.
+
+## H3.7 Cliente — `cli/`
+
+- `dfsha login <u> -u <url1>,<url2> --ca-cert certs/ca.crt`, con `--api-key` o
+  pidiendo el código 2FA si hace falta. Cada petición va al líder y cambia
+  sola de ControlNode tras un failover.
+- `put`: sube cada bloque una vez al primero de su cadena (prueba el
+  siguiente si falla), reintenta `confirm` mientras llegan los informes y
+  renueva el lease; `--lock <id>` para escribir con un lock explícito.
+- `get`: lee de la primera réplica que funcione.
+- Comandos nuevos: `status`, `chmod`, `chgrp`, `acl get|set|rm`,
+  `group create|add|remove|list|delete`, `lock`, `unlock`, `locks`,
+  `2fa status|setup|enable|disable`, `apikey create|list|revoke`.
+
+## H3.8 Infraestructura
+
+`docker-compose.yml`: `controlnode-1` (primario, :8000), `controlnode-2`
+(respaldo, :8010), `datanode-1..4` (:8001–8004). Todo con TLS (certificados
+por nodo en `certs/`) y secretos en `.env`, ambos generados por
+`scripts/setup_cluster.py` y fuera de git. `scripts/verify_hito3.py` verifica
+el hito con caídas reales.
 
 ---
 
@@ -468,13 +648,23 @@ alcance. Todos comparten `DFSHA_JWT_SECRET`.
 
 | Módulo | Contenido |
 |---|---|
-| `app/models.py` | `User`, `Directory`, `File`, `DataNode`, `Block`, `PendingDeletion` (SQLAlchemy) |
+| `app/models.py` | `User`, `Directory`, `File`, `DataNode`, `Block`, `BlockReplica`, `PendingDeletion`, `ReplicationTask`, `FileLock`, `Group`, `GroupMember`, `AclEntry`, `ApiKey`, `HALogEntry`, `HAMeta` |
 | `app/database.py` | `engine`, `SessionLocal`, `get_db` |
-| `app/deps.py` | `get_current_user` |
+| `app/deps.py` | `get_current_user` (API key, JWT, X-Username de desarrollo), `get_session_user` |
 | `app/path_service.py` | Resolución/validación de rutas, excepciones |
-| `app/placement.py` | Liveness de DataNodes, partición y round-robin |
-| `app/block_gc.py` | Cola de borrado de bloques (`discard_blocks`) |
+| `app/acl.py` | Permisos efectivos y comprobaciones (`require_*`) |
+| `app/locks.py` | Locks y leases de escritura |
+| `app/placement.py` | Liveness de DataNodes, partición y cadenas de réplica |
+| `app/replication.py` | Informes, re-replicación, sobrantes, conciliación |
+| `app/block_gc.py` | Cola de borrado de bloques (`discard_blocks`, `discard_replica`) |
+| `app/cluster_auth.py` | Tokens de nodo y de bloque |
+| `app/ha/` | Log de cambios, `/ha/*`, failover y middleware |
 | `app/schemas.py` | Todos los modelos Pydantic mencionados arriba |
-| `app/main.py` | App FastAPI, `/health`, seed de la raíz, migración de `blocks` |
+| `app/main.py` | App FastAPI, `/health`, migraciones, seed, bucles de HA y re-replicación |
 | `datanode/` | Servicio DataNode |
-| `cli/dfsha_cli/distributed.py` | put/get por bloques |
+| `cli/dfsha_cli/distributed.py` | put/get por bloques con réplicas |
+
+**Regla para código nuevo:** toda escritura de metadatos debe pasar por el
+ORM (`db.add`, `db.delete`, asignar atributos). Un `delete()`/`update()` de
+Core no dispara los eventos que alimentan la réplica entre ControlNodes y no
+se replicaría.

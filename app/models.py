@@ -32,6 +32,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -51,8 +52,8 @@ class User(Base):
     Autenticación: `password_hash` guarda la contraseña hasheada y
     POST /auth/login la verifica para emitir un JWT (ver app/routers/auth.py
     y app/security.py). El control de acceso por usuario —que un usuario no
-    pueda tocar los archivos de otro— es del Hito 3: aquí `owner_id` registra
-    al dueño pero el namespace sigue siendo global.
+    pueda tocar los archivos de otro— lo aplica app/acl.py desde el Hito 3
+    con dueño, grupo, bits de modo y ACL.
     """
 
     __tablename__ = "users"
@@ -65,6 +66,16 @@ class User(Base):
     # hash no puede iniciar sesión hasta que un login le fije contraseña.
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # 2FA (TOTP, RFC 6238). `totp_secret` se fija en /auth/2fa/setup y solo
+    # se exige en el login cuando `totp_enabled`; `totp_last_counter` evita
+    # reutilizar el mismo código dos veces (anti-replay).
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
+    totp_last_counter: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False
+    )
 
     directories: Mapped[list["Directory"]] = relationship(back_populates="owner")
     files: Mapped[list["File"]] = relationship(back_populates="owner")
@@ -88,8 +99,18 @@ class Directory(Base):
     )
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # Control de acceso (Hito 3, ver app/acl.py): grupo dueño y bits de modo
+    # estilo Unix (rwx para dueño/grupo/otros, más el sticky bit 0o1000).
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="SET NULL"), nullable=True
+    )
+    mode: Mapped[int] = mapped_column(Integer, default=0o755, server_default="493", nullable=False)
 
     owner: Mapped["User"] = relationship(back_populates="directories")
+    group: Mapped["Group | None"] = relationship()
+    acl_entries: Mapped[list["AclEntry"]] = relationship(
+        back_populates="directory", cascade="all, delete-orphan"
+    )
     parent: Mapped["Directory | None"] = relationship(
         remote_side=[id], back_populates="children"
     )
@@ -130,9 +151,20 @@ class File(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="SET NULL"), nullable=True
+    )
+    mode: Mapped[int] = mapped_column(Integer, default=0o644, server_default="420", nullable=False)
 
     owner: Mapped["User"] = relationship(back_populates="files")
     parent: Mapped["Directory"] = relationship(back_populates="files")
+    group: Mapped["Group | None"] = relationship()
+    acl_entries: Mapped[list["AclEntry"]] = relationship(
+        back_populates="file", cascade="all, delete-orphan"
+    )
+    locks: Mapped[list["FileLock"]] = relationship(
+        back_populates="file", cascade="all, delete-orphan"
+    )
     # Bloques en que se particiona este archivo (Hito 2, DFS distribuido).
     # En el Hito 1 monolítico esta lista queda vacía: el contenido vive como
     # un blob único en disco (ver app/routers/transfer.py). Con la escritura
@@ -179,6 +211,13 @@ class DataNode(Base):
     node_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False)
+    # "http" o "https" (Hito 3: TLS).
+    scheme: Mapped[str] = mapped_column(String(8), default="http", server_default="http", nullable=False)
+    # Dirección con la que lo alcanzan los OTROS nodos (cadena de escritura y
+    # re-replicación). En docker-compose `host` es localhost (para la CLI del
+    # anfitrión) pero entre contenedores hace falta el nombre del servicio.
+    internal_host: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    internal_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # "alive" | "dead". Es solo el último estado reportado; la liveness real
     # combina esto con la antigüedad de last_heartbeat.
     status: Mapped[str] = mapped_column(String(16), default="alive", nullable=False)
@@ -190,6 +229,14 @@ class DataNode(Base):
     )
 
     blocks: Mapped[list["Block"]] = relationship(back_populates="datanode")
+
+    @property
+    def peer_host(self) -> str:
+        return self.internal_host or self.host
+
+    @property
+    def peer_port(self) -> int:
+        return self.internal_port or self.port
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<DataNode node_id={self.node_id!r} {self.host}:{self.port} status={self.status}>"
@@ -257,7 +304,13 @@ class Block(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     file: Mapped["File"] = relationship(back_populates="blocks")
+    # Desde el Hito 3, `datanode` es solo el nodo PRIMARIO de la cadena de
+    # escritura (al que el cliente sube). Dónde está el bloque de verdad lo
+    # dice `replicas`.
     datanode: Mapped["DataNode"] = relationship(back_populates="blocks")
+    replicas: Mapped[list["BlockReplica"]] = relationship(
+        back_populates="block", cascade="all, delete-orphan", order_by="BlockReplica.id"
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Block block_id={self.block_id!r} file_id={self.file_id} idx={self.block_index}>"
@@ -294,6 +347,218 @@ class PendingDeletion(Base):
     # Sin FK: el archivo normalmente ya no existe cuando el DataNode borra.
     file_id: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # No se entrega antes de esta hora: periodo de gracia para lectores que
+    # obtuvieron el plan justo antes de que el bloque saliera del namespace.
+    not_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default="1970-01-01 00:00:00", nullable=False
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<PendingDeletion block_id={self.block_id!r} datanode_id={self.datanode_id}>"
+
+
+class BlockReplica(Base):
+    """Una copia de un bloque en un DataNode (Hito 3, replicación).
+
+    Estados:
+    - `pending`: asignada (cadena de escritura o re-replicación), todavía
+      sin confirmar por el DataNode.
+    - `stored`: el DataNode informó que la guardó (POST
+      /datanodes/blocks/received), con el checksum que él mismo calculó.
+
+    El ControlNode nunca se fía del cliente para saber dónde quedó un
+    bloque: solo cuentan los informes de los DataNodes.
+    """
+
+    __tablename__ = "block_replicas"
+    __table_args__ = (UniqueConstraint("block_pk", "datanode_id", name="uq_block_replica"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    block_pk: Mapped[int] = mapped_column(
+        ForeignKey("blocks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    datanode_id: Mapped[int] = mapped_column(
+        ForeignKey("datanodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    state: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    block: Mapped["Block"] = relationship(back_populates="replicas")
+    datanode: Mapped["DataNode"] = relationship()
+
+
+class ReplicationTask(Base):
+    """Orden de copiar un bloque de `source` a `target` para recuperar su
+    factor de replicación (alta disponibilidad). Se entrega al DataNode
+    origen en la respuesta de su heartbeat; se cumple cuando el destino
+    informa que guardó el bloque, y se reprograma si vence."""
+
+    __tablename__ = "replication_tasks"
+    __table_args__ = (UniqueConstraint("block_pk", "target_id", name="uq_replication_task"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    block_pk: Mapped[int] = mapped_column(
+        ForeignKey("blocks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("datanodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_id: Mapped[int] = mapped_column(
+        ForeignKey("datanodes.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    block: Mapped["Block"] = relationship()
+    source: Mapped["DataNode"] = relationship(foreign_keys=[source_id])
+    target: Mapped["DataNode"] = relationship(foreign_keys=[target_id])
+
+
+class FileLock(Base):
+    """Lock sobre un archivo (RF3 lock(), consistencia ante escrituras
+    concurrentes).
+
+    - `exclusive`: un solo dueño; nadie más puede escribir ni tomar otro
+      lock. Las escrituras (allocate/confirm) toman uno implícito
+      (`implicit=True`, un *lease*) que se libera al confirmar.
+    - `shared`: varios lectores; impide que otros escriban mientras dure.
+
+    Todos vencen (`expires_at`): un cliente que muere no deja el archivo
+    bloqueado para siempre.
+    """
+
+    __tablename__ = "file_locks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lock_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    file_id: Mapped[int] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    implicit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    file: Mapped["File"] = relationship(back_populates="locks")
+    owner: Mapped["User"] = relationship()
+
+
+class Group(Base):
+    """Grupo de usuarios para compartir archivos (Hito 3, control de acceso).
+    Lo crea cualquier usuario, que queda como dueño y puede añadir o quitar
+    miembros."""
+
+    __tablename__ = "groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    owner: Mapped["User"] = relationship()
+    members: Mapped[list["GroupMember"]] = relationship(
+        back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class GroupMember(Base):
+    __tablename__ = "group_members"
+    __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_group_member"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    group: Mapped["Group"] = relationship(back_populates="members")
+    user: Mapped["User"] = relationship()
+
+
+class AclEntry(Base):
+    """Entrada de ACL: permisos rwx (bits 4/2/1) para un usuario o grupo
+    concreto sobre un archivo o directorio, además de los bits de modo.
+    Exactamente uno de `directory_id`/`file_id` y uno de
+    `user_id`/`group_id` va informado."""
+
+    __tablename__ = "acl_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    directory_id: Mapped[int | None] = mapped_column(
+        ForeignKey("directories.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    file_id: Mapped[int | None] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True
+    )
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), nullable=True
+    )
+    perms: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    directory: Mapped["Directory | None"] = relationship(back_populates="acl_entries")
+    file: Mapped["File | None"] = relationship(back_populates="acl_entries")
+    user: Mapped["User | None"] = relationship()
+    group: Mapped["Group | None"] = relationship()
+
+
+class ApiKey(Base):
+    """API key de un usuario (Hito 3): alternativa al login interactivo para
+    scripts. Solo se guarda el SHA-256 de la clave; la clave completa se
+    muestra una única vez al crearla."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(16), unique=True, nullable=False, index=True)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    user: Mapped["User"] = relationship()
+
+
+# --------------------------------------------------------------------------
+# Alta disponibilidad del ControlNode (Hito 3). Estas dos tablas son LOCALES
+# de cada ControlNode: no se replican (ver app/ha/).
+# --------------------------------------------------------------------------
+class HALogEntry(Base):
+    """Log de cambios de metadatos que el líder genera en la misma
+    transacción que cada escritura y que los respaldos aplican en orden."""
+
+    __tablename__ = "ha_log"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    table_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    op: Mapped[str] = mapped_column(String(8), nullable=False)
+    row: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class HAMeta(Base):
+    """Estado persistente de HA de este nodo (p. ej. la época)."""
+
+    __tablename__ = "ha_meta"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+# Tablas que no viajan por el log de replicación.
+LOCAL_TABLES = frozenset({"ha_log", "ha_meta"})

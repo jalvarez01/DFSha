@@ -50,6 +50,9 @@ class DirectoryEntry(BaseModel):
     type: EntryType
     size_bytes: int = Field(description="0 para directorios")
     created_at: datetime
+    owner: str | None = Field(default=None, description="username del dueño")
+    group: str | None = Field(default=None, description="grupo dueño, si tiene")
+    mode: str | None = Field(default=None, description="permisos estilo ls -l, p. ej. 'drwxr-x---'")
 
 
 class ListDirectoryResponse(BaseModel):
@@ -119,6 +122,9 @@ class StatResponse(BaseModel):
     updated_at: datetime | None = Field(
         default=None, description="None para directorios (no registran modificación)"
     )
+    group: str | None = None
+    mode: str | None = Field(default=None, description="permisos estilo ls -l")
+    mode_octal: str | None = Field(default=None, description="permisos en octal, p. ej. '0750'")
 
 
 # --------------------------------------------------------------------------
@@ -162,6 +168,7 @@ class LoginRequest(BaseModel):
 
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
+    otp: str | None = Field(default=None, description="Código 2FA de 6 dígitos, si el usuario activó 2FA")
 
 
 class TokenResponse(BaseModel):
@@ -199,12 +206,40 @@ class DataNodeRegisterRequest(BaseModel):
     node_id: str = Field(min_length=1, max_length=128, description="Id estable elegido por el DataNode")
     host: str = Field(min_length=1, max_length=255, description="Host/IP alcanzable por el cliente")
     port: int = Field(ge=1, le=65535)
+    scheme: str = Field(default="http", pattern="^https?$")
+    internal_host: str | None = Field(
+        default=None, max_length=255, description="Host con el que lo alcanzan los otros nodos"
+    )
+    internal_port: int | None = Field(default=None, ge=1, le=65535)
+
+
+class ReceivedBlock(BaseModel):
+    """Un bloque que un DataNode acaba de guardar, con el checksum que él
+    mismo calculó."""
+
+    block_id: str
+    checksum: str = Field(min_length=64, max_length=64)
+    size_bytes: int = Field(ge=0)
 
 
 class HeartbeatRequest(BaseModel):
     """Cuerpo de POST /datanodes/heartbeat."""
 
     node_id: str = Field(min_length=1, max_length=128)
+    received_blocks: list[ReceivedBlock] = Field(
+        default_factory=list,
+        description="Informes de bloques guardados que no se pudieron enviar al momento",
+    )
+    corrupt_blocks: list[str] = Field(
+        default_factory=list, description="block_ids cuyo contenido en disco no cuadra con su checksum"
+    )
+    controlnodes: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Testigo para el failover: segundos desde el último contacto OK con cada "
+            "ControlNode (por controlnode_id)"
+        ),
+    )
     deleted_blocks: list[str] = Field(
         default_factory=list,
         description=(
@@ -241,6 +276,12 @@ class HeartbeatResponse(BaseModel):
             "siguiente heartbeat vía `deleted_blocks`."
         ),
     )
+    replicate: list["ReplicateCommand"] = Field(
+        default_factory=list, description="Órdenes de copiar bloques a otros DataNodes"
+    )
+    role: str = Field(default="leader", description="Rol de este ControlNode: leader | standby")
+    epoch: int = 1
+    controlnode_id: str = ""
 
 
 class DataNodeLocation(BaseModel):
@@ -250,6 +291,39 @@ class DataNodeLocation(BaseModel):
     node_id: str
     host: str
     port: int
+    scheme: str = "http"
+
+
+class ReplicateCommand(BaseModel):
+    """Orden para un DataNode: copiar su réplica de `block_id` a `targets`
+    (re-replicación). `token` es un token de escritura para el destino."""
+
+    block_id: str
+    file_id: int
+    token: str
+    targets: list[DataNodeLocation] = Field(description="Direcciones internas de los destinos")
+
+
+class BlocksReceivedRequest(BaseModel):
+    """POST /datanodes/blocks/received: el DataNode informa que guardó bloques."""
+
+    node_id: str
+    blocks: list[ReceivedBlock]
+
+
+class BlockReportRequest(BaseModel):
+    """POST /datanodes/block-report: inventario completo de un DataNode, para
+    reconciliar réplicas perdidas o huérfanas."""
+
+    node_id: str
+    blocks: list[ReceivedBlock]
+
+
+class BlockReportResponse(BaseModel):
+    known: int
+    added: int
+    lost: int
+    orphans: int
 
 
 # --- Cliente <-> ControlNode: plan de escritura (allocate + confirm) ------
@@ -263,6 +337,7 @@ class AllocateRequest(BaseModel):
         ge=1,
         description="Tamaño de bloque deseado; si es None se usa settings.block_size_bytes",
     )
+    lease_id: str | None = Field(default=None, description="Lock exclusivo que ya tiene el cliente, si lo tomó antes")
 
 
 class AllocatedBlock(BaseModel):
@@ -279,7 +354,13 @@ class AllocatedBlock(BaseModel):
         )
     )
     size_bytes: int = Field(description="Bytes que debe tener este bloque")
-    datanode: DataNodeLocation
+    datanode: DataNodeLocation = Field(description="Primer nodo de la cadena (a él sube el cliente)")
+    datanodes: list[DataNodeLocation] = Field(
+        default_factory=list,
+        description="Cadena de réplica completa, en orden. Si el primero no responde, el cliente prueba el siguiente",
+    )
+    token: str = Field(default="", description="Token de escritura del bloque (Authorization en el DataNode)")
+    lease_id: str | None = Field(default=None, description="Lease de escritura que hay que mandar en confirm")
 
 
 class BlockAllocateRequest(BaseModel):
@@ -289,6 +370,7 @@ class BlockAllocateRequest(BaseModel):
     uno nuevo al final (índice == número de bloques actuales)."""
 
     size_bytes: int = Field(ge=0, description="Tamaño del nuevo contenido de este bloque")
+    lease_id: str | None = Field(default=None, description="Lease o lock exclusivo que ya tiene el cliente")
 
 
 class AllocateResponse(BaseModel):
@@ -301,6 +383,8 @@ class AllocateResponse(BaseModel):
     block_size: int = Field(description="Tamaño de bloque efectivamente usado")
     total_size: int
     blocks: list[AllocatedBlock]
+    lease_id: str | None = Field(default=None, description="Lease de escritura exclusivo (mandarlo en confirm)")
+    replication: int = Field(default=1, description="Réplicas por bloque en este plan")
 
 
 class ConfirmBlock(BaseModel):
@@ -315,6 +399,7 @@ class ConfirmRequest(BaseModel):
     """Cuerpo de POST /files/{path}/confirm: los bloques que se subieron OK."""
 
     blocks: list[ConfirmBlock]
+    lease_id: str | None = Field(default=None, description="Lease de escritura devuelto por allocate")
 
 
 class ConfirmResponse(BaseModel):
@@ -337,7 +422,11 @@ class BlockPlacement(BaseModel):
     file_id: int = Field(description="Id del archivo dueño del bloque (ver AllocatedBlock)")
     size_bytes: int
     checksum: str | None = Field(description="SHA-256 hex esperado del bloque")
-    datanode: DataNodeLocation
+    datanode: DataNodeLocation = Field(description="Réplica preferida (la primera de `datanodes`)")
+    datanodes: list[DataNodeLocation] = Field(
+        default_factory=list, description="Réplicas disponibles, vivas primero; el cliente prueba en orden"
+    )
+    token: str = Field(default="", description="Token de lectura del bloque")
 
 
 class BlocksResponse(BaseModel):
@@ -350,3 +439,138 @@ class BlocksResponse(BaseModel):
     size_bytes: int
     num_blocks: int
     blocks: list[BlockPlacement]
+
+
+# ==========================================================================
+# Contrato Hito 3 — Seguridad, consistencia y alta disponibilidad
+# ==========================================================================
+class TwoFactorSetupResponse(BaseModel):
+    secret: str = Field(description="Secreto TOTP en base32 (para escribirlo en la app de autenticación)")
+    otpauth_uri: str = Field(description="URI otpauth:// (se puede convertir en QR)")
+
+
+class TwoFactorCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
+class TwoFactorStatusResponse(BaseModel):
+    username: str
+    enabled: bool
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ApiKeyInfo(BaseModel):
+    id: int
+    name: str
+    prefix: str
+    created_at: datetime
+    expires_at: datetime | None
+    last_used_at: datetime | None
+    revoked: bool
+
+
+class ApiKeyCreateResponse(ApiKeyInfo):
+    key: str = Field(description="La clave completa. Solo se muestra esta vez")
+
+
+class GroupCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+
+
+class GroupMemberRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+
+
+class GroupResponse(BaseModel):
+    name: str
+    owner: str
+    members: list[str]
+    created_at: datetime
+
+
+class ChmodRequest(BaseModel):
+    path: str
+    mode: str = Field(description="Octal, p. ej. '750' o '1777'")
+
+
+class ChgrpRequest(BaseModel):
+    path: str
+    group: str | None = Field(description="Nombre del grupo, o null para quitarlo")
+
+
+class AclEntryModel(BaseModel):
+    type: str = Field(pattern="^(user|group)$")
+    name: str
+    perms: str = Field(description="'rwx', 'r-x', ...")
+
+
+class AclResponse(BaseModel):
+    path: str
+    owner: str
+    group: str | None
+    mode: str
+    mode_octal: str
+    entries: list[AclEntryModel]
+
+
+class AclSetRequest(BaseModel):
+    path: str
+    type: str = Field(pattern="^(user|group)$")
+    name: str
+    perms: str
+
+
+class AclRemoveRequest(BaseModel):
+    path: str
+    type: str = Field(pattern="^(user|group)$")
+    name: str
+
+
+class LockRequest(BaseModel):
+    mode: str = Field(default="exclusive", pattern="^(exclusive|shared)$")
+    ttl_seconds: int | None = Field(default=None, ge=1)
+
+
+class LockResponse(BaseModel):
+    lock_id: str
+    path: str
+    mode: str
+    owner: str
+    expires_at: datetime
+    implicit: bool = False
+
+
+class ClusterNodeStatus(BaseModel):
+    node_id: str
+    address: str
+    status: str
+    blocks: int
+
+
+class ControlNodeStatus(BaseModel):
+    controlnode_id: str
+    role: str
+    epoch: int
+    leader_id: str | None
+    applied_seq: int
+    peers: list[dict] = Field(default_factory=list)
+
+
+class ClusterStatusResponse(BaseModel):
+    controlnode: ControlNodeStatus
+    replication_factor: int
+    datanodes: list[ClusterNodeStatus]
+    files: int
+    blocks: int
+    under_replicated: int
+    missing: int
+    pending_replications: int
+    pending_deletions: int
+
+
+# HeartbeatResponse referencia a ReplicateCommand, definido después.
+HeartbeatResponse.model_rebuild()

@@ -24,6 +24,9 @@ Uso:
     pip install httpx
     python scripts/verify_hito2.py [--base-url http://localhost:8000] [--size 200000] [--block-size 65536]
 
+Contra el clúster del Hito 3 (TLS, tokens de bloque, réplicas):
+    python scripts/verify_hito2.py --base-url https://localhost:8000 --ca-cert certs/ca.crt
+
 Sale con código 0 si todo pasó, 1 si algo falló.
 """
 from __future__ import annotations
@@ -49,22 +52,43 @@ def fail(msg: str) -> None:
     print(f"  \033[31m✗\033[0m {msg}")
 
 
+def url(location: dict) -> str:
+    return f"{location.get('scheme', 'http')}://{location['host']}:{location['port']}"
+
+
+def bearer(block: dict) -> dict:
+    return {"Authorization": f"Bearer {block['token']}"}
+
+
+def confirm_with_retry(client: httpx.Client, path: str, blocks: list, lease_id) -> httpx.Response:
+    """Los DataNodes informan al ControlNode cada bloque guardado; si el
+    informe aún no llegó, confirm responde 409 replicas_not_ready."""
+    deadline = time.monotonic() + 15
+    while True:
+        resp = client.post(f"/files{path}/confirm", json={"blocks": blocks, "lease_id": lease_id})
+        if resp.status_code != 409 or time.monotonic() > deadline:
+            return resp
+        time.sleep(0.5)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--base-url", default="http://localhost:8000", help="URL del ControlNode líder")
+    parser.add_argument("--ca-cert", default=None, help="CA del clúster para verificar TLS (Hito 3)")
     parser.add_argument("--size", type=int, default=200_000, help="Tamaño del archivo de prueba (bytes)")
     parser.add_argument("--block-size", type=int, default=65_536, help="Tamaño de bloque a pedir")
     parser.add_argument("--path", default="/verify_hito2_test.bin")
     parser.add_argument(
         "--deletion-timeout",
         type=float,
-        default=45.0,
-        help="Segundos a esperar a que los DataNodes borren los bloques (≈ 2 heartbeats + margen)",
+        default=90.0,
+        help="Segundos a esperar a que los DataNodes borren los bloques (gracia de 60 s + heartbeats)",
     )
     args = parser.parse_args()
 
     failures = 0
-    client = httpx.Client(base_url=args.base_url, timeout=10.0)
+    verify = args.ca_cert or True
+    client = httpx.Client(base_url=args.base_url, timeout=10.0, verify=verify)
 
     # --- 0. Login ----------------------------------------------------
     print("[0] Autenticación")
@@ -74,8 +98,9 @@ def main() -> int:
         return 1
     token = resp.json()["access_token"]
     client.headers["Authorization"] = f"Bearer {token}"
-    # El mismo JWT se propaga a los DataNodes.
-    dn_client = httpx.Client(timeout=10.0, headers={"Authorization": f"Bearer {token}"})
+    # A los DataNodes no va el JWT: cada bloque trae su propio token de
+    # bloque, firmado por el ControlNode (Hito 3).
+    dn_client = httpx.Client(timeout=10.0, verify=verify)
     ok("login OK, token obtenido")
 
     # Un archivo de una corrida anterior interrumpida no debe estorbar.
@@ -106,12 +131,12 @@ def main() -> int:
         start = block["index"] * plan["block_size"]
         data = original[start : start + block["size_bytes"]]
         dn = block["datanode"]
-        put_url = f"http://{dn['host']}:{dn['port']}/blocks/{block['block_id']}"
+        put_url = f"{url(dn)}/blocks/{block['block_id']}"
         put_resp = dn_client.put(
             put_url,
             params={"file_id": block["file_id"]},
             content=data,
-            headers={"X-Checksum-Sha256": sha256(data)},
+            headers={"X-Checksum-Sha256": sha256(data), **bearer(block)},
         )
         if put_resp.status_code != 200:
             fail(f"PUT a datanode {dn['node_id']} falló: {put_resp.status_code} {put_resp.text}")
@@ -121,7 +146,7 @@ def main() -> int:
         )
     ok(f"{len(confirm_blocks)} bloque(s) subidos directo a sus DataNodes")
 
-    resp = client.post(f"/files{args.path}/confirm", json={"blocks": confirm_blocks})
+    resp = confirm_with_retry(client, args.path, confirm_blocks, plan.get("lease_id"))
     confirmed = resp.json()
     if not confirmed.get("complete"):
         fail(f"confirm incompleto: {confirmed}")
@@ -136,7 +161,7 @@ def main() -> int:
     reassembled = bytearray()
     for block in read_plan["blocks"]:
         dn = block["datanode"]
-        get_resp = dn_client.get(f"http://{dn['host']}:{dn['port']}/blocks/{block['block_id']}")
+        get_resp = dn_client.get(f"{url(dn)}/blocks/{block['block_id']}", headers=bearer(block))
         if get_resp.status_code != 200:
             fail(f"GET a datanode {dn['node_id']} falló: {get_resp.status_code}")
             failures += 1
@@ -165,10 +190,10 @@ def main() -> int:
         alloc = resp.json()
         dn = alloc["datanode"]
         dn_client.put(
-            f"http://{dn['host']}:{dn['port']}/blocks/{alloc['block_id']}",
+            f"{url(dn)}/blocks/{alloc['block_id']}",
             params={"file_id": alloc["file_id"]},
             content=new_content,
-            headers={"X-Checksum-Sha256": sha256(new_content)},
+            headers={"X-Checksum-Sha256": sha256(new_content), **bearer(alloc)},
         )
         during = client.get(f"/files{args.path}/blocks").json()
         during_by_index = {b["index"]: b["checksum"] for b in during["blocks"]}
@@ -177,9 +202,11 @@ def main() -> int:
         else:
             fail("el plan de lectura cambió antes de confirmar el reemplazo")
             failures += 1
-        client.post(
-            f"/files{args.path}/confirm",
-            json={"blocks": [{"block_id": alloc["block_id"], "checksum": sha256(new_content), "size_bytes": len(new_content)}]},
+        confirm_with_retry(
+            client,
+            args.path,
+            [{"block_id": alloc["block_id"], "checksum": sha256(new_content), "size_bytes": len(new_content)}],
+            alloc.get("lease_id"),
         )
         after = client.get(f"/files{args.path}/blocks").json()
         after_by_index = {b["index"]: b["checksum"] for b in after["blocks"]}
@@ -198,18 +225,20 @@ def main() -> int:
     final_plan = client.get(f"/files{args.path}/blocks").json()
     sample = final_plan["blocks"][0]
     dn = sample["datanode"]
-    base_dn = f"http://{dn['host']}:{dn['port']}"
-    anon = httpx.get(f"{base_dn}/blocks/{sample['block_id']}", timeout=10.0)
+    base_dn = url(dn)
+    anon = dn_client.get(f"{base_dn}/blocks/{sample['block_id']}")
     if anon.status_code == 401:
-        ok("GET de bloque sin JWT -> 401")
+        ok("GET de bloque sin token -> 401")
     else:
-        fail(f"GET de bloque sin JWT devolvió {anon.status_code}")
+        fail(f"GET de bloque sin token devolvió {anon.status_code}")
         failures += 1
+    # Un token de escritura válido, pero con un checksum que no cuadra.
+    target = plan["blocks"][-1]
     bad = dn_client.put(
-        f"{base_dn}/blocks/verify-bad-checksum",
-        params={"file_id": "verify"},
+        f"{url(target['datanode'])}/blocks/{target['block_id']}",
+        params={"file_id": target["file_id"]},
         content=b"contenido",
-        headers={"X-Checksum-Sha256": "0" * 64},
+        headers={"X-Checksum-Sha256": "0" * 64, **bearer(target)},
     )
     if bad.status_code == 400:
         ok("PUT con checksum incorrecto -> 400 checksum_mismatch")
@@ -227,8 +256,12 @@ def main() -> int:
     print("\n[5] rm propagado a los DataNodes")
     # Todos los bloques que llegaron a existir: los del plan final más el
     # bloque 0 original, reemplazado en el paso 3.
-    all_blocks = {(b["block_id"], b["datanode"]["host"], b["datanode"]["port"]) for b in final_plan["blocks"]}
-    all_blocks |= {(b["block_id"], b["datanode"]["host"], b["datanode"]["port"]) for b in read_plan["blocks"]}
+    # Cada réplica de cada bloque, con su token de lectura.
+    all_blocks = {
+        (b["block_id"], url(loc), b["token"])
+        for b in final_plan["blocks"] + read_plan["blocks"]
+        for loc in (b.get("datanodes") or [b["datanode"]])
+    }
     resp = client.request("DELETE", "/fs/rm", json={"path": args.path})
     if resp.status_code != 200:
         fail(f"rm falló: {resp.status_code} {resp.text}")
@@ -238,17 +271,20 @@ def main() -> int:
     deadline = time.monotonic() + args.deletion_timeout
     remaining = set(all_blocks)
     while remaining and time.monotonic() < deadline:
-        for block_id, host, port in list(remaining):
-            r = dn_client.get(f"http://{host}:{port}/blocks/{block_id}")
+        for block_id, base, read_token in list(remaining):
+            try:
+                r = dn_client.get(f"{base}/blocks/{block_id}", headers={"Authorization": f"Bearer {read_token}"})
+            except httpx.HTTPError:
+                continue
             if r.status_code == 404:
-                remaining.discard((block_id, host, port))
+                remaining.discard((block_id, base, read_token))
         if remaining:
             time.sleep(1)
     if remaining:
         fail(f"{len(remaining)} bloque(s) siguen en los DataNodes tras {args.deletion_timeout:.0f}s")
         failures += 1
     else:
-        ok(f"los {len(all_blocks)} bloque(s) (incluido el reemplazado) desaparecieron de los DataNodes")
+        ok(f"las {len(all_blocks)} réplica(s) (incluido el bloque reemplazado) desaparecieron de los DataNodes")
 
     print()
     if failures == 0:

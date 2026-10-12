@@ -1,142 +1,192 @@
-# docker-compose del clúster DFSha (Hito 2): 1 ControlNode + N DataNodes.
+# docker-compose del clúster DFSha (Hito 3): 2 ControlNodes (líder +
+# respaldo) + 4 DataNodes, con TLS en todas las conexiones, replicación de
+# bloques (factor 3) y cifrado en reposo.
 #
-# Levanta el servicio distribuido completo en una red privada (`dfsha_net`),
-# tal como pide la Opción 1 (C/S con distribución S2S, sistema autónomo):
-#
-#   - controlnode : esta app FastAPI en su rol de NameNode/HDFS. Guarda solo
-#                   metadatos (namespace + tabla de bloques) y decide el
-#                   placement. Es el único con estado en SQLite.
-#   - datanode-1..3 : servicios de bloques (carpeta ./datanode). Cada uno se
-#                   registra y late contra el ControlNode, almacena los
-#                   bloques que le asignen y valida el JWT de los clientes.
+# Antes de levantarlo por primera vez (genera certs/ y .env, que NO se suben
+# al repositorio):
+#   pip install cryptography
+#   python scripts/setup_cluster.py
 #
 # Uso:
 #   docker compose up --build -d
-#   dfsha login <usuario> -u http://localhost:8000
-#   dfsha put archivo.bin && dfsha get archivo.bin copia.bin
-#   python scripts/verify_hito2.py            # verificación end-to-end
+#   dfsha login ana -u https://localhost:8000,https://localhost:8010 --ca-cert certs/ca.crt
+#   dfsha put archivo.bin && dfsha get archivo.bin copia.bin && dfsha status
+#   python scripts/verify_hito3.py            # verificación end-to-end con caídas
 #
-# Para escalar el número de DataNodes basta con copiar un bloque `datanode-N`
-# (cada uno con su node_id, su puerto y su volumen). Se dejan 3 como ejemplo.
+# Componentes:
+#   - controlnode-1 : arranca como PRIMARIO (líder). Metadatos en SQLite.
+#   - controlnode-2 : RESPALDO. Sigue al líder aplicando su log de cambios
+#                     (ControlNode <-> ControlNode) y toma el control si cae.
+#   - datanode-1..4 : guardan bloques cifrados. Cada bloque va a 3 de ellos
+#                     (cadena DataNode -> DataNode); si uno cae, el líder
+#                     ordena re-replicar sus bloques en los demás.
 #
 # --- Contrato ControlNode <-> DataNode -------------------------------------
-# Cada DataNode lee estas variables de entorno y, al arrancar, hace
-# `POST {DFSHA_CONTROLNODE_URL}/datanodes/register` con:
-#     { "node_id": DFSHA_DATANODE_ID,
-#       "host":    DFSHA_DATANODE_ADVERTISE_HOST,
-#       "port":    DFSHA_DATANODE_ADVERTISE_PORT }
-# y luego `POST /datanodes/heartbeat` cada DFSHA_HEARTBEAT_INTERVAL segundos
-# (holgadamente < heartbeat_ttl del ControlNode, 30 s por defecto). La
-# respuesta del heartbeat trae las órdenes de borrado de bloques; el
-# ControlNode NUNCA llama al DataNode, así que no necesita alcanzarlo.
+# Cada DataNode late a TODOS los ControlNodes (DFSHA_CONTROLNODE_URLS); el
+# líder responde con órdenes (borrar, copiar a otro DataNode) y los
+# respaldos solo anotan el informe de testigo que usan para el failover. El
+# ControlNode NUNCA llama a un DataNode. Todo va con tokens firmados con
+# DFSHA_CLUSTER_SECRET, que debe ser el mismo en todos los nodos.
 #
-# `host`/`port` son la dirección con la que el CLIENTE alcanza al DataNode
-# para subir/bajar bloques. Se anuncia `localhost` y cada DataNode publica
-# su puerto en el host (8001..8003), así que la CLI corriendo en la máquina
-# anfitriona funciona sin configurar nada. Para un cliente en OTRA máquina,
-# cambia DFSHA_DATANODE_ADVERTISE_HOST por la IP/nombre del anfitrión.
-#
-# DFSHA_JWT_SECRET debe ser el MISMO en el ControlNode y en los DataNodes:
-# el DataNode valida con él los tokens que emite el ControlNode.
+# `host`/`port` anunciados son los que usa el CLIENTE (localhost y el puerto
+# publicado en el anfitrión). Entre DataNodes se usa la dirección interna
+# (nombre del servicio). Para un cliente en OTRA máquina, cambia
+# DFSHA_DATANODE_ADVERTISE_HOST por la IP/nombre del anfitrión (y añádelo a
+# los certificados en scripts/setup_cluster.py).
+
+x-controlnode: &controlnode
+  build: .
+  image: dfsha-controlnode:hito3
+  networks:
+    - dfsha_net
+  healthcheck:
+    test: ["CMD", "python", "-c", "import ssl,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('https://localhost:8000/health', context=ssl._create_unverified_context()).status == 200 else 1)"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+
+x-controlnode-env: &controlnode-env
+  DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?Corre antes: python scripts/setup_cluster.py}"
+  DFSHA_CLUSTER_SECRET: "${DFSHA_CLUSTER_SECRET:?Corre antes: python scripts/setup_cluster.py}"
+  DFSHA_CA_CERT: /certs/ca.crt
+  DFSHA_DATABASE_URL: "sqlite:////data/dfsha.db"
+  DFSHA_STORAGE_DIR: "/data/blocks"
+  DFSHA_BLOCK_SIZE_BYTES: "8388608"       # 8 MiB
+  DFSHA_REPLICATION_FACTOR: "3"
+  DFSHA_HEARTBEAT_TTL_SECONDS: "30"
+  DFSHA_HA_FAILOVER_SECONDS: "15"
+
+x-datanode: &datanode
+  build: ./datanode
+  image: dfsha-datanode:hito3
+  depends_on:
+    controlnode-1:
+      condition: service_started
+  networks:
+    - dfsha_net
+
+x-datanode-env: &datanode-env
+  DFSHA_CLUSTER_SECRET: "${DFSHA_CLUSTER_SECRET:?Corre antes: python scripts/setup_cluster.py}"
+  DFSHA_CONTROLNODE_URLS: "https://controlnode-1:8000,https://controlnode-2:8000"
+  DFSHA_CA_CERT: /certs/ca.crt
+  DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
+  DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
+  DFSHA_HEARTBEAT_INTERVAL: "10"
 
 services:
-  controlnode:
-    build: .
-    image: dfsha-controlnode:hito2
-    container_name: dfsha-controlnode
+  controlnode-1:
+    <<: *controlnode
+    container_name: dfsha-controlnode-1
     environment:
-      # Secreto JWT compartido por todo el servicio (obligatorio fuera de dev).
-      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
-      # Metadatos en el volumen persistente.
-      DFSHA_DATABASE_URL: "sqlite:////data/dfsha.db"
-      DFSHA_STORAGE_DIR: "/data/blocks"
-      # Tamaño de bloque y ventana de liveness (opcionales; valen los defaults).
-      DFSHA_BLOCK_SIZE_BYTES: "8388608"       # 8 MiB
-      DFSHA_HEARTBEAT_TTL_SECONDS: "30"
+      <<: *controlnode-env
+      DFSHA_CONTROLNODE_ID: "cn1"
+      DFSHA_HA_INITIAL_ROLE: "primary"
+      DFSHA_HA_PEERS: "https://controlnode-2:8000"
+      DFSHA_PUBLIC_URL: "https://localhost:8000"
+      DFSHA_TLS_CERT: /certs/controlnode-1.crt
+      DFSHA_TLS_KEY: /certs/controlnode-1.key
     ports:
       - "8000:8000"
     volumes:
-      - controlnode_data:/data
-    networks:
-      - dfsha_net
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
+      - controlnode1_data:/data
+      - ./certs:/certs:ro
+
+  controlnode-2:
+    <<: *controlnode
+    container_name: dfsha-controlnode-2
+    depends_on:
+      controlnode-1:
+        condition: service_started
+    environment:
+      <<: *controlnode-env
+      DFSHA_CONTROLNODE_ID: "cn2"
+      DFSHA_HA_INITIAL_ROLE: "standby"
+      DFSHA_HA_PEERS: "https://controlnode-1:8000"
+      DFSHA_PUBLIC_URL: "https://localhost:8010"
+      DFSHA_TLS_CERT: /certs/controlnode-2.crt
+      DFSHA_TLS_KEY: /certs/controlnode-2.key
+    ports:
+      - "8010:8000"
+    volumes:
+      - controlnode2_data:/data
+      - ./certs:/certs:ro
 
   datanode-1:
-    build: ./datanode
-    image: dfsha-datanode:hito2
+    <<: *datanode
     container_name: dfsha-datanode-1
-    depends_on:
-      controlnode:
-        condition: service_healthy
     environment:
+      <<: *datanode-env
       DFSHA_DATANODE_ID: "datanode-1"
-      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8001"
-      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
-      DFSHA_HEARTBEAT_INTERVAL: "10"
-      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+      DFSHA_DATANODE_INTERNAL_HOST: "datanode-1"
+      DFSHA_DATANODE_STORAGE_KEY: "${DFSHA_DN1_STORAGE_KEY:?Corre antes: python scripts/setup_cluster.py}"
+      DFSHA_TLS_CERT: /certs/datanode-1.crt
+      DFSHA_TLS_KEY: /certs/datanode-1.key
     ports:
       - "8001:8001"
     volumes:
       - datanode1_data:/data
-    networks:
-      - dfsha_net
+      - ./certs:/certs:ro
 
   datanode-2:
-    build: ./datanode
-    image: dfsha-datanode:hito2
+    <<: *datanode
     container_name: dfsha-datanode-2
-    depends_on:
-      controlnode:
-        condition: service_healthy
     environment:
+      <<: *datanode-env
       DFSHA_DATANODE_ID: "datanode-2"
-      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8002"
-      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
-      DFSHA_HEARTBEAT_INTERVAL: "10"
-      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+      DFSHA_DATANODE_INTERNAL_HOST: "datanode-2"
+      DFSHA_DATANODE_STORAGE_KEY: "${DFSHA_DN2_STORAGE_KEY:?Corre antes: python scripts/setup_cluster.py}"
+      DFSHA_TLS_CERT: /certs/datanode-2.crt
+      DFSHA_TLS_KEY: /certs/datanode-2.key
     ports:
       - "8002:8002"
     volumes:
       - datanode2_data:/data
-    networks:
-      - dfsha_net
+      - ./certs:/certs:ro
 
   datanode-3:
-    build: ./datanode
-    image: dfsha-datanode:hito2
+    <<: *datanode
     container_name: dfsha-datanode-3
-    depends_on:
-      controlnode:
-        condition: service_healthy
     environment:
+      <<: *datanode-env
       DFSHA_DATANODE_ID: "datanode-3"
-      DFSHA_CONTROLNODE_URL: "http://controlnode:8000"
-      DFSHA_DATANODE_ADVERTISE_HOST: "localhost"
       DFSHA_DATANODE_ADVERTISE_PORT: "8003"
-      DFSHA_DATANODE_STORAGE_DIR: "/data/blocks"
-      DFSHA_HEARTBEAT_INTERVAL: "10"
-      DFSHA_JWT_SECRET: "cambia-esto-en-produccion"
+      DFSHA_DATANODE_INTERNAL_HOST: "datanode-3"
+      DFSHA_DATANODE_STORAGE_KEY: "${DFSHA_DN3_STORAGE_KEY:?Corre antes: python scripts/setup_cluster.py}"
+      DFSHA_TLS_CERT: /certs/datanode-3.crt
+      DFSHA_TLS_KEY: /certs/datanode-3.key
     ports:
       - "8003:8003"
     volumes:
       - datanode3_data:/data
-    networks:
-      - dfsha_net
+      - ./certs:/certs:ro
+
+  datanode-4:
+    <<: *datanode
+    container_name: dfsha-datanode-4
+    environment:
+      <<: *datanode-env
+      DFSHA_DATANODE_ID: "datanode-4"
+      DFSHA_DATANODE_ADVERTISE_PORT: "8004"
+      DFSHA_DATANODE_INTERNAL_HOST: "datanode-4"
+      DFSHA_DATANODE_STORAGE_KEY: "${DFSHA_DN4_STORAGE_KEY:?Corre antes: python scripts/setup_cluster.py}"
+      DFSHA_TLS_CERT: /certs/datanode-4.crt
+      DFSHA_TLS_KEY: /certs/datanode-4.key
+    ports:
+      - "8004:8004"
+    volumes:
+      - datanode4_data:/data
+      - ./certs:/certs:ro
 
 networks:
   dfsha_net:
     driver: bridge
 
 volumes:
-  controlnode_data:
+  controlnode1_data:
+  controlnode2_data:
   datanode1_data:
   datanode2_data:
   datanode3_data:
+  datanode4_data:

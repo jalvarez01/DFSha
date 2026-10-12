@@ -21,7 +21,13 @@ Dos puntos de diseño que conviene tener presentes al leer el código:
      el borrado en disco quedan blobs huérfanos (inofensivo), mientras que
      al revés quedaría metadata apuntando a contenido inexistente.
 
-2. Cascada de borrado
+2. Control de acceso (Hito 3)
+   Cada endpoint comprueba permisos con app/acl.py antes de tocar nada:
+   atravesar exige `x` en los ancestros, listar `r`, crear/borrar `w+x` en
+   el padre (con sticky bit, solo el dueño borra). chmod, chgrp y ACL están
+   aquí también: son parte de la gestión del sistema de archivos.
+
+3. Cascada de borrado
    El subárbol de un `rmdir --recursive` lo borra la cascada del ORM
    (`cascade="all, delete-orphan"` en app/models.py), que carga los hijos y
    recorre el árbol. NO se puede sustituir por un DELETE masivo: el
@@ -32,13 +38,16 @@ Dos puntos de diseño que conviene tener presentes al leer el código:
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import acl
 from app.block_gc import discard_blocks_of_files
 from app.database import get_db
 from app.deps import get_current_user
-from app.models import Directory, File, User
+from app.locks import assert_not_locked_by_others
+from app.models import AclEntry, Directory, File, Group, GroupMember, User
 from app.path_service import (
     AlreadyExistsError,
     InvalidPathError,
@@ -63,6 +72,12 @@ from app.path_service import (
 # almacenamiento real.
 from app.routers.transfer import delete_local_blobs
 from app.schemas import (
+    AclEntryModel,
+    AclRemoveRequest,
+    AclResponse,
+    AclSetRequest,
+    ChgrpRequest,
+    ChmodRequest,
     DeleteResponse,
     DirectoryEntry,
     DirectoryResponse,
@@ -133,7 +148,7 @@ def _existing_file_at(db: Session, path: str, cwd_id: int | None) -> File | None
 
 
 def _create_child_directory(
-    db: Session, parent: Directory, name: str, owner_id: int
+    db: Session, parent: Directory, name: str, user: User
 ) -> Directory:
     """Crea un subdirectorio y lo deja con id asignado (flush), sin confirmar.
 
@@ -150,8 +165,10 @@ def _create_child_directory(
         raise AlreadyExistsError(f"Ya existe un directorio llamado {name!r} en esa ruta")
     if find_child_file(db, parent.id, name) is not None:
         raise AlreadyExistsError(f"Ya existe un archivo llamado {name!r} en esa ruta")
+    acl.require_create(db, user, parent)
 
-    child = Directory(name=name, parent=parent, owner_id=owner_id)
+    child = Directory(name=name, parent=parent, owner_id=user.id)
+    acl.apply_creation_defaults(child, parent)
     db.add(child)
     db.flush()
     return child
@@ -179,6 +196,14 @@ def _missing_ancestors(
             parent_path, leaf = split_parent_and_leaf(current)
             missing.append(leaf)
             current = parent_path
+
+
+def _permission_fields(node: Directory | File) -> dict:
+    return {
+        "owner": node.owner.username,
+        "group": node.group.name if node.group else None,
+        "mode": acl.mode_string(node),
+    }
 
 
 def _directory_response(db: Session, directory: Directory) -> DirectoryResponse:
@@ -211,6 +236,9 @@ def list_directory(
         directory = resolve_directory(db, path, cwd_id)
     except PathError as exc:
         raise _http_error(exc) from exc
+    if directory.parent is not None:
+        acl.require_traverse(db, user, directory.parent)
+    acl.require(db, user, directory, acl.R, "no puedes listar el directorio")
 
     subdirs, files = list_children(db, directory)
     entries = [
@@ -219,6 +247,7 @@ def list_directory(
             type=EntryType.DIRECTORY,
             size_bytes=0,
             created_at=subdir.created_at,
+            **_permission_fields(subdir),
         )
         for subdir in subdirs
     ]
@@ -228,6 +257,7 @@ def list_directory(
             type=EntryType.FILE,
             size_bytes=file_row.size_bytes,
             created_at=file_row.created_at,
+            **_permission_fields(file_row),
         )
         for file_row in files
     )
@@ -258,11 +288,11 @@ def make_directory(
 
     try:
         if payload.parents:
-            directory = _make_directory_recursive(db, payload.path, cwd_id, user.id, response)
+            directory = _make_directory_recursive(db, payload.path, cwd_id, user, response)
         else:
             resolved = resolve_parent_and_name(db, payload.path, cwd_id)
             directory = _create_child_directory(
-                db, resolved.parent, resolved.leaf_name, user.id
+                db, resolved.parent, resolved.leaf_name, user
             )
         db.commit()
     except PathError as exc:
@@ -282,7 +312,7 @@ def make_directory(
 
 
 def _make_directory_recursive(
-    db: Session, path: str, cwd_id: int | None, owner_id: int, response: Response
+    db: Session, path: str, cwd_id: int | None, user: User, response: Response
 ) -> Directory:
     """Rama `parents=true` de mkdir. Separada para que el endpoint se lea."""
     try:
@@ -303,7 +333,7 @@ def _make_directory_recursive(
 
     parent, missing = _missing_ancestors(db, path, cwd_id)
     for name in missing:
-        parent = _create_child_directory(db, parent, name, owner_id)
+        parent = _create_child_directory(db, parent, name, user)
     return parent
 
 
@@ -329,6 +359,9 @@ def remove_directory(
             )
     except PathError as exc:
         raise _http_error(exc) from exc
+    acl.require_delete(db, user, directory.parent, directory)
+    if payload.recursive:
+        _check_recursive_delete(db, user, directory)
 
     # La ruta y los ids se leen ANTES del borrado: tras el commit el objeto
     # queda desacoplado de la sesión y recorrer sus relaciones fallaría.
@@ -341,6 +374,27 @@ def remove_directory(
     delete_local_blobs(file_ids)
 
     return DeleteResponse(path=full_path, deleted=True)
+
+
+def _check_recursive_delete(db: Session, user: User, directory: Directory) -> None:
+    """`rm -r`: hace falta poder vaciar cada directorio del subárbol (rwx en
+    él, y el sticky bit respetado) y que ningún archivo esté bloqueado por
+    otro usuario. Se comprueba todo ANTES de borrar nada."""
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        subdirs, files = list_children(db, current)
+        if subdirs or files:
+            acl.require(db, user, current, acl.R | acl.W | acl.X, "no puedes vaciar el directorio")
+        for child in [*subdirs, *files]:
+            if current.mode & acl.STICKY and not acl.is_superuser(user):
+                if user.id not in (child.owner_id, current.owner_id):
+                    raise acl.PermissionDenied(
+                        f"Permiso denegado: {child.name} está en un directorio con sticky bit y no es tuyo"
+                    )
+        for file_row in files:
+            assert_not_locked_by_others(db, file_row, user)
+        pending.extend(subdirs)
 
 
 def _collect_descendant_file_ids(db: Session, directory: Directory) -> list[int]:
@@ -372,6 +426,8 @@ def remove_file(
         file_row = resolve_file(db, payload.path, cwd_id)
     except PathError as exc:
         raise _http_error(exc) from exc
+    acl.require_delete(db, user, file_row.parent, file_row)
+    assert_not_locked_by_others(db, file_row, user)
 
     # Igual que en rmdir: capturar id y ruta antes de borrar. resolve_file
     # llega al archivo por un SELECT plano y nunca carga la relación .parent,
@@ -417,6 +473,8 @@ def stat_entry(
         raise _http_error(exc) from exc
 
     if directory is not None:
+        if directory.parent is not None:
+            acl.require_traverse(db, user, directory.parent)
         return StatResponse(
             path=get_full_path(db, directory),
             # La raíz se guarda con nombre vacío; hacia fuera se muestra "/".
@@ -426,12 +484,16 @@ def stat_entry(
             owner=directory.owner.username,
             created_at=directory.created_at,
             updated_at=None,
+            group=directory.group.name if directory.group else None,
+            mode=acl.mode_string(directory),
+            mode_octal=f"{directory.mode:04o}",
         )
 
     try:
         file_row = resolve_file(db, path, cwd_id)
     except PathError as exc:
         raise _http_error(exc) from exc
+    acl.require_traverse(db, user, file_row.parent)
 
     return StatResponse(
         path=_join_path(get_full_path(db, file_row.parent), file_row.name),
@@ -441,4 +503,157 @@ def stat_entry(
         owner=file_row.owner.username,
         created_at=file_row.created_at,
         updated_at=file_row.updated_at,
+        group=file_row.group.name if file_row.group else None,
+        mode=acl.mode_string(file_row),
+        mode_octal=f"{file_row.mode:04o}",
     )
+
+
+# --------------------------------------------------------------------------
+# Permisos: chmod, chgrp y ACL (Hito 3)
+# --------------------------------------------------------------------------
+def _resolve_node(db: Session, path: str) -> tuple[Directory | File, str]:
+    """Resuelve una ruta a directorio o archivo, comprobando que se pueda
+    llegar a ella (x en los ancestros). Devuelve también su ruta absoluta."""
+    try:
+        directory = resolve_directory(db, path)
+    except (NotFoundError, NotADirectoryError):
+        directory = None
+    except PathError as exc:
+        raise _http_error(exc) from exc
+    if directory is not None:
+        return directory, get_full_path(db, directory)
+    try:
+        file_row = resolve_file(db, path)
+    except PathError as exc:
+        raise _http_error(exc) from exc
+    return file_row, _join_path(get_full_path(db, file_row.parent), file_row.name)
+
+
+def _acl_response(db: Session, node: Directory | File, path: str) -> AclResponse:
+    entries = []
+    for entry in node.acl_entries:
+        if entry.user_id is not None:
+            entries.append(AclEntryModel(type="user", name=entry.user.username, perms=acl.perms_string(entry.perms)))
+        else:
+            entries.append(AclEntryModel(type="group", name=entry.group.name, perms=acl.perms_string(entry.perms)))
+    return AclResponse(
+        path=path,
+        owner=node.owner.username,
+        group=node.group.name if node.group else None,
+        mode=acl.mode_string(node),
+        mode_octal=f"{node.mode:04o}",
+        entries=sorted(entries, key=lambda e: (e.type, e.name)),
+    )
+
+
+def _bad_request(error: str, message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=ErrorResponse(error=error, message=message).model_dump())
+
+
+def _principal(db: Session, kind: str, name: str) -> User | Group:
+    model = User if kind == "user" else Group
+    column = User.username if kind == "user" else Group.name
+    row = db.scalar(select(model).where(column == name))
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorResponse(error="not_found", message=f"No existe el {'usuario' if kind == 'user' else 'grupo'} {name!r}").model_dump(),
+        )
+    return row
+
+
+def _guard_owner(db: Session, user: User, node: Directory | File) -> None:
+    parent = node.parent
+    if parent is not None:
+        acl.require_traverse(db, user, parent)
+    acl.require_owner(user, node)
+
+
+@router.post("/chmod", response_model=AclResponse)
+def change_mode(payload: ChmodRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Cambia los bits de modo (octal, como chmod 750). Solo el dueño."""
+    node, path = _resolve_node(db, payload.path)
+    _guard_owner(db, user, node)
+    try:
+        mode = int(payload.mode, 8)
+    except ValueError:
+        raise _bad_request("invalid_mode", f"Modo inválido: {payload.mode!r} (usa octal, p. ej. 750)") from None
+    if not 0 <= mode <= 0o1777:
+        raise _bad_request("invalid_mode", f"Modo fuera de rango: {payload.mode!r}")
+    node.mode = mode
+    db.commit()
+    db.refresh(node)
+    return _acl_response(db, node, path)
+
+
+@router.post("/chgrp", response_model=AclResponse)
+def change_group(payload: ChgrpRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Cambia el grupo dueño. Solo el dueño, y solo a un grupo del que sea miembro."""
+    node, path = _resolve_node(db, payload.path)
+    _guard_owner(db, user, node)
+    if payload.group is None:
+        node.group_id = None
+    else:
+        group = _principal(db, "group", payload.group)
+        is_member = db.scalar(
+            select(GroupMember.id).where(GroupMember.group_id == group.id, GroupMember.user_id == user.id)
+        )
+        if is_member is None and not acl.is_superuser(user):
+            raise acl.PermissionDenied(f"Permiso denegado: no eres miembro del grupo {group.name!r}")
+        node.group_id = group.id
+    db.commit()
+    db.refresh(node)
+    return _acl_response(db, node, path)
+
+
+@router.get("/acl", response_model=AclResponse)
+def get_acl(path: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    node, full_path = _resolve_node(db, path)
+    if node.parent is not None:
+        acl.require_traverse(db, user, node.parent)
+    return _acl_response(db, node, full_path)
+
+
+@router.post("/acl", response_model=AclResponse)
+def set_acl(payload: AclSetRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Añade o cambia una entrada de ACL (setfacl -m). Solo el dueño."""
+    node, path = _resolve_node(db, payload.path)
+    _guard_owner(db, user, node)
+    try:
+        perms = acl.parse_perms(payload.perms)
+    except ValueError as exc:
+        raise _bad_request("invalid_perms", str(exc)) from exc
+    principal = _principal(db, payload.type, payload.name)
+    for entry in node.acl_entries:
+        if (payload.type == "user" and entry.user_id == principal.id) or (
+            payload.type == "group" and entry.group_id == principal.id
+        ):
+            entry.perms = perms
+            break
+    else:
+        entry = AclEntry(perms=perms)
+        if payload.type == "user":
+            entry.user_id = principal.id
+        else:
+            entry.group_id = principal.id
+        node.acl_entries.append(entry)
+    db.commit()
+    db.refresh(node)
+    return _acl_response(db, node, path)
+
+
+@router.delete("/acl", response_model=AclResponse)
+def remove_acl(payload: AclRemoveRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Quita una entrada de ACL (setfacl -x). Solo el dueño."""
+    node, path = _resolve_node(db, payload.path)
+    _guard_owner(db, user, node)
+    principal = _principal(db, payload.type, payload.name)
+    for entry in list(node.acl_entries):
+        if (payload.type == "user" and entry.user_id == principal.id) or (
+            payload.type == "group" and entry.group_id == principal.id
+        ):
+            node.acl_entries.remove(entry)
+    db.commit()
+    db.refresh(node)
+    return _acl_response(db, node, path)

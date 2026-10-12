@@ -39,7 +39,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app import acl
 from app.block_gc import discard_blocks
+from app.locks import assert_not_locked_by_others
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import File as FileModel
@@ -177,6 +179,11 @@ async def put_file(
 
     existing = find_child_file(db, parent.id, leaf_name)
     created = existing is None
+    if existing is not None:
+        acl.require_write_file(db, user, existing)
+        assert_not_locked_by_others(db, existing, user)
+    else:
+        acl.require_create(db, user, parent)
 
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -184,6 +191,7 @@ async def put_file(
         file_row = existing
     else:
         file_row = FileModel(name=leaf_name, parent_id=parent.id, owner_id=user.id, size_bytes=0)
+        acl.apply_creation_defaults(file_row, parent)
         db.add(file_row)
         db.flush()  # asigna file_row.id sin comprometer la transacción todavía
 
@@ -236,6 +244,7 @@ async def get_file(
         file_row = resolve_file(db, path, cwd_id)
     except PathError as exc:
         raise _http_error(exc) from exc
+    acl.require_read_file(db, user, file_row)
 
     blob_path = _blob_path(file_row.id)
     if not blob_path.exists() and file_row.blocks:
@@ -295,6 +304,7 @@ def head_file(
         file_row = resolve_file(db, path, cwd_id)
     except PathError as exc:
         raise _http_error(exc) from exc
+    acl.require_read_file(db, user, file_row)
 
     headers = {"Content-Length": str(file_row.size_bytes)}
     checksum = _read_checksum(file_row.id)

@@ -3,6 +3,7 @@ import hashlib
 import pytest
 
 from app.storage import (
+    BlockExistsError,
     BlockNotFoundError,
     BlockStore,
     ChecksumMismatchError,
@@ -34,10 +35,13 @@ def test_get_missing_raises(store):
         store.get("no-existe")
 
 
-def test_put_overwrite_replaces_content(store):
+def test_un_bloque_es_inmutable(store):
     store.put("blk-1", "file-42", b"version vieja")
-    store.put("blk-1", "file-42", b"version nueva")
-    assert store.get("blk-1") == b"version nueva"
+    with pytest.raises(BlockExistsError):
+        store.put("blk-1", "file-42", b"version nueva")
+    assert store.get("blk-1") == b"version vieja"
+    # El mismo contenido otra vez es un no-op (reintento idempotente).
+    store.put("blk-1", "file-42", b"version vieja")
 
 
 def test_delete_removes_block(store):
@@ -143,3 +147,73 @@ def test_temporales_huerfanos_se_limpian_al_arrancar(tmp_path):
     (tmp_path / "file-42" / "blk-1.abc.tmp").write_bytes(b"a medias")
     BlockStore(tmp_path)
     assert list((tmp_path / "file-42").iterdir()) == []
+
+
+# --------------------------------------------------------------------------
+# Cifrado en reposo (AES-256-GCM)
+# --------------------------------------------------------------------------
+@pytest.fixture()
+def encrypted(tmp_path):
+    import os
+
+    return BlockStore(tmp_path, key=os.urandom(32))
+
+
+@pytest.mark.parametrize("size", [0, 1, 65535, 65536, 65537, 300_000])
+def test_cifrado_ida_y_vuelta(encrypted, tmp_path, size):
+    import os
+
+    data = os.urandom(size)
+    encrypted.put("blk-1", "f", data)
+    assert encrypted.get("blk-1") == data
+    assert encrypted.inventory()[0]["size_bytes"] == size
+
+
+def test_en_disco_no_queda_el_texto_en_claro(encrypted, tmp_path):
+    encrypted.put("blk-1", "f", b"DATO-CONFIDENCIAL-" * 1000)
+    assert b"DATO-CONFIDENCIAL" not in (tmp_path / "f" / "blk-1").read_bytes()
+    assert encrypted.encrypted
+
+
+def test_bloque_cifrado_alterado_se_detecta(encrypted, tmp_path):
+    encrypted.put("blk-1", "f", b"x" * 1000)
+    path = tmp_path / "f" / "blk-1"
+    raw = bytearray(path.read_bytes())
+    raw[50] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    with pytest.raises(CorruptBlockError):
+        encrypted.get("blk-1")
+
+
+def test_bloque_cifrado_truncado_se_detecta(encrypted, tmp_path):
+    encrypted.put("blk-1", "f", b"x" * 70_000)  # dos trozos
+    path = tmp_path / "f" / "blk-1"
+    path.write_bytes(path.read_bytes()[: 13 + 65536 + 16])  # sin el trozo final
+    with pytest.raises(CorruptBlockError):
+        encrypted.get("blk-1")
+
+
+def test_con_otra_clave_no_se_lee(encrypted, tmp_path):
+    import os
+
+    encrypted.put("blk-1", "f", b"secreto")
+    with pytest.raises(CorruptBlockError):
+        BlockStore(tmp_path, key=os.urandom(32)).get("blk-1")
+
+
+def test_bloques_viejos_sin_cifrar_se_siguen_leyendo(tmp_path):
+    import os
+
+    BlockStore(tmp_path).put("viejo", "f", b"en claro")
+    store = BlockStore(tmp_path, key=os.urandom(32))
+    assert store.get("viejo") == b"en claro"
+
+
+def test_clave_mal_formada_se_rechaza():
+    import base64
+
+    from app.storage import load_key
+
+    with pytest.raises(ValueError):
+        load_key(base64.b64encode(b"corta").decode())
+    assert load_key("") is None

@@ -214,6 +214,9 @@ def split_parent_and_leaf(path: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 # Capa 2: resolución contra la base de datos
 # --------------------------------------------------------------------------
+ROOT_MODE = 0o1777
+
+
 def get_or_create_root(db: Session, owner_id: int) -> Directory:
     """Devuelve el directorio raíz ("/"), creándolo si es la primera vez
     que arranca el servidor. Se llama típicamente una sola vez, en el
@@ -221,7 +224,9 @@ def get_or_create_root(db: Session, owner_id: int) -> Directory:
     root = db.scalar(select(Directory).where(Directory.parent_id.is_(None)))
     if root is not None:
         return root
-    root = Directory(name=ROOT_NAME, parent_id=None, owner_id=owner_id)
+    # 1777 como /tmp: todos pueden crear entradas en la raíz, pero el sticky
+    # bit hace que solo el dueño de cada una pueda borrarla (app/acl.py).
+    root = Directory(name=ROOT_NAME, parent_id=None, owner_id=owner_id, mode=ROOT_MODE)
     db.add(root)
     db.commit()
     db.refresh(root)

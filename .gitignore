@@ -13,8 +13,9 @@ venv/
 *.sqlite3
 /data/
 
-# Entorno
+# Entorno y secretos del clúster (scripts/setup_cluster.py)
 .env
+certs/
 
 # Editores / OS
 .vscode/

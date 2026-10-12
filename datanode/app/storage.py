@@ -1,36 +1,48 @@
 """Almacenamiento local de bloques de este DataNode.
 
 Decisión de equipo (RNF4): "archivo como directorio, bloque como archivo".
-En vez de un blob monolítico por archivo (como en el Hito 1), cada archivo
-del DFS es una CARPETA en este DataNode (nombrada por su `file_id`, el que
-asigna el ControlNode) y cada bloque de ese archivo es un ARCHIVO suelto
-dentro de esa carpeta (nombrado por su `block_id` opaco). Consecuencia
-directa del requisito "en un DataNode no debe estar el archivo completo":
-ESTE nodo solo ve los bloques que le tocaron a él, nunca el archivo entero
-reensamblado (eso solo pasa en el cliente).
+Cada archivo del DFS es una CARPETA en este DataNode (nombrada por su
+`file_id`, el que asigna el ControlNode) y cada bloque de ese archivo es un
+ARCHIVO suelto dentro de esa carpeta (nombrado por su `block_id` opaco).
+ESTE nodo solo ve los bloques que le tocaron, nunca el archivo entero.
 
     <storage_dir>/<file_id>/<block_id>          contenido del bloque
-    <storage_dir>/<file_id>/<block_id>.sha256   su checksum SHA-256 (hex)
+    <storage_dir>/<file_id>/<block_id>.sha256   SHA-256 (hex) del contenido EN CLARO
 
 Seguridad: `file_id` y `block_id` llegan de la red y se usan para armar
 rutas en disco, así que se validan contra `_ID_PATTERN` (solo letras,
 dígitos, `_` y `-`). Sin eso, un `file_id` como `../..` permitiría escribir
 o borrar fuera de `storage_dir`.
 
+Cifrado en reposo (Hito 3, RNF6): si hay clave (`DFSHA_DATANODE_STORAGE_KEY`),
+cada bloque se guarda cifrado con AES-256-GCM, en trozos de 64 KiB para no
+cargarlo entero en memoria:
+
+    "DFSE1\\n" | prefijo de nonce (7 bytes aleatorios) | trozo_0 | trozo_1 | ...
+    trozo_i = AES-GCM(clave, nonce = prefijo | ¿último? (1 byte) | i (4 bytes),
+                      texto = 64 KiB de contenido (el último, lo que quede),
+                      datos asociados = "DFSE1\\n")  -> texto cifrado + etiqueta de 16 bytes
+
+El byte "¿último?" va dentro del nonce: si alguien trunca el archivo, el
+trozo que queda al final no se descifra como último y la lectura falla
+(se detecta igual que cualquier otra corrupción). Los bloques escritos sin
+cifrar (antes de activar la clave) se siguen leyendo.
+
 Integridad: el checksum se calcula en streaming al escribir y se guarda al
 lado del bloque. Si el cliente manda el checksum esperado, un bloque que
 no coincide se rechaza sin llegar a guardarse. Al leer, el bloque se
-verifica contra su checksum antes de servirse: un bloque corrupto en disco
-nunca sale del nodo.
+verifica contra su checksum antes de servirse.
 
-Un índice en memoria (`block_id -> file_id`) evita tener que buscar en qué
-carpeta vive un bloque en GET/DELETE (el cliente solo manda el block_id,
-ver CONTRATOS.md). Se reconstruye escaneando el disco al arrancar, así que
-sobrevive a reinicios sin necesitar una base de datos aparte.
+Inmutabilidad (Hito 3, consistencia): un bloque ya guardado no se puede
+sobrescribir con otro contenido (`BlockExistsError`). Un PUT repetido con el
+mismo contenido es un no-op (reintentos idempotentes). Contenido nuevo =
+`block_id` nuevo, así que un lector nunca ve un bloque cambiar a mitad.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import os
 import re
 import shutil
 import uuid
@@ -39,11 +51,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 CHUNK_SIZE = 64 * 1024
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CHECKSUM_SUFFIX = ".sha256"
 _TMP_SUFFIX = ".tmp"
+
+_MAGIC = b"DFSE1\n"
+_PREFIX_LEN = 7
+_HEADER_LEN = len(_MAGIC) + _PREFIX_LEN
+_TAG_LEN = 16
+_CIPHER_CHUNK = CHUNK_SIZE + _TAG_LEN
 
 
 class BlockNotFoundError(Exception):
@@ -61,24 +82,57 @@ class ChecksumMismatchError(Exception):
         self.actual = actual
 
 
+class BlockExistsError(Exception):
+    """Ya hay un bloque con ese id y otro contenido (los bloques son inmutables)."""
+
+
 class CorruptBlockError(Exception):
-    """El contenido en disco ya no coincide con el checksum guardado."""
+    """El contenido en disco ya no coincide con su checksum (o no se descifra)."""
 
 
 def validate_id(value: str, kind: str = "id") -> str:
     if not _ID_PATTERN.fullmatch(value):
-        raise InvalidIdError(
-            f"{kind} inválido: {value!r} (solo letras, dígitos, '_' y '-', máx. 128)"
-        )
+        raise InvalidIdError(f"{kind} inválido: {value!r} (solo letras, dígitos, '_' y '-', máx. 128)")
     return value
 
 
-def sha256_of(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def load_key(encoded: str) -> bytes | None:
+    """Clave AES-256 desde base64 (vacío = sin cifrado)."""
+    if not encoded:
+        return None
+    key = base64.b64decode(encoded)
+    if len(key) != 32:
+        raise ValueError("DFSHA_DATANODE_STORAGE_KEY debe ser base64 de 32 bytes (AES-256)")
+    return key
+
+
+def _nonce(prefix: bytes, index: int, last: bool) -> bytes:
+    return prefix + (b"\x01" if last else b"\x00") + index.to_bytes(4, "big")
+
+
+class _EncryptingWriter:
+    def __init__(self, f, key: bytes) -> None:
+        self._f = f
+        self._aead = AESGCM(key)
+        self._prefix = os.urandom(_PREFIX_LEN)
+        self._buffer = bytearray()
+        self._index = 0
+        f.write(_MAGIC + self._prefix)
+
+    def write(self, data: bytes) -> None:
+        self._buffer.extend(data)
+        # Un trozo solo se emite como "no último" si sabemos que viene más.
+        while len(self._buffer) > CHUNK_SIZE:
+            self._emit(bytes(self._buffer[:CHUNK_SIZE]), last=False)
+            del self._buffer[:CHUNK_SIZE]
+
+    def _emit(self, plain: bytes, last: bool) -> None:
+        self._f.write(self._aead.encrypt(_nonce(self._prefix, self._index, last), plain, _MAGIC))
+        self._index += 1
+
+    def close(self) -> None:
+        self._emit(bytes(self._buffer), last=True)
+        self._buffer.clear()
 
 
 @dataclass
@@ -93,22 +147,36 @@ class PendingWrite:
     tmp_path: Path
     _file: object
     _hasher: object
+    _encryptor: _EncryptingWriter | None = None
     size: int = 0
 
     def write(self, chunk: bytes) -> None:
-        self._file.write(chunk)
+        if self._encryptor is not None:
+            self._encryptor.write(chunk)
+        else:
+            self._file.write(chunk)
         self._hasher.update(chunk)
         self.size += len(chunk)
 
+    def _close(self) -> None:
+        if self._encryptor is not None:
+            self._encryptor.close()
+        self._file.close()
+
 
 class BlockStore:
-    def __init__(self, storage_dir: Path) -> None:
+    def __init__(self, storage_dir: Path, key: bytes | None = None) -> None:
         self._root = storage_dir
         self._root.mkdir(parents=True, exist_ok=True)
+        self._key = key
         self._lock = Lock()
         # block_id -> file_id. Reconstruido escaneando <root>/<file_id>/<block_id>.
         self._index: dict[str, str] = {}
         self._rebuild_index()
+
+    @property
+    def encrypted(self) -> bool:
+        return self._key is not None
 
     @staticmethod
     def _is_block_file(path: Path) -> bool:
@@ -146,30 +214,41 @@ class BlockStore:
         # Nombre de temporal único: dos subidas concurrentes del mismo
         # bloque no se pisan el archivo a medio escribir.
         tmp = target.with_name(f"{block_id}.{uuid.uuid4().hex}{_TMP_SUFFIX}")
+        f = open(tmp, "wb")
         return PendingWrite(
             block_id=block_id,
             file_id=file_id,
             tmp_path=tmp,
-            _file=open(tmp, "wb"),
+            _file=f,
             _hasher=hashlib.sha256(),
+            _encryptor=_EncryptingWriter(f, self._key) if self._key else None,
         )
 
     def abort(self, pending: PendingWrite) -> None:
-        pending._file.close()
-        pending.tmp_path.unlink(missing_ok=True)
+        try:
+            pending._file.close()
+        finally:
+            pending.tmp_path.unlink(missing_ok=True)
 
     def commit(self, pending: PendingWrite, expected_checksum: str | None = None) -> tuple[int, str]:
         """Cierra la escritura. Si `expected_checksum` no coincide, descarta
-        el temporal y lanza ChecksumMismatchError (el bloque anterior, si
-        había, queda intacto). Rename atómico: nunca queda un bloque a medias."""
-        pending._file.close()
+        el temporal y lanza ChecksumMismatchError. Si el bloque ya existía
+        con el mismo contenido, es un no-op; con otro, BlockExistsError.
+        Rename atómico: nunca queda un bloque a medias."""
+        pending._close()
         checksum = pending._hasher.hexdigest()
         if expected_checksum is not None and checksum != expected_checksum.lower():
             pending.tmp_path.unlink(missing_ok=True)
             raise ChecksumMismatchError(expected_checksum, checksum)
 
-        target = self._path_for(pending.file_id, pending.block_id)
         with self._lock:
+            existing = self._locate_unlocked(pending.block_id)
+            if existing is not None:
+                pending.tmp_path.unlink(missing_ok=True)
+                if self._stored_checksum(existing) == checksum:
+                    return pending.size, checksum
+                raise BlockExistsError(f"El bloque {pending.block_id} ya existe con otro contenido")
+            target = self._path_for(pending.file_id, pending.block_id)
             self._checksum_path(target).write_text(checksum)
             pending.tmp_path.replace(target)
             self._index[pending.block_id] = pending.file_id
@@ -192,17 +271,69 @@ class BlockStore:
         return self.commit(pending, expected_checksum)
 
     def put(self, block_id: str, file_id: str, data: bytes, expected_checksum: str | None = None) -> tuple[int, str]:
-        """Guarda (o reemplaza) el contenido de un bloque. Devuelve
-        (tamaño_bytes, checksum_sha256_hex)."""
+        """Guarda el contenido de un bloque. Devuelve (tamaño_bytes, checksum_sha256_hex)."""
         return self.put_stream(block_id, file_id, [data], expected_checksum)
 
     # -- lectura -----------------------------------------------------------
+    def _stored_checksum(self, path: Path) -> str:
+        checksum_path = self._checksum_path(path)
+        if checksum_path.exists():
+            return checksum_path.read_text().strip()
+        return self._hash(path)
+
+    def _hash(self, path: Path) -> str:
+        hasher = hashlib.sha256()
+        for chunk in self.iter_block(path):
+            hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _is_encrypted_file(path: Path) -> bool:
+        with open(path, "rb") as f:
+            return f.read(len(_MAGIC)) == _MAGIC
+
+    def plain_size(self, path: Path) -> int:
+        size = path.stat().st_size
+        if not self._is_encrypted_file(path):
+            return size
+        body = size - _HEADER_LEN
+        chunks = max(1, -(-body // _CIPHER_CHUNK))
+        return body - chunks * _TAG_LEN
+
+    def iter_block(self, path: Path) -> Iterator[bytes]:
+        """Contenido EN CLARO del bloque, por chunks (descifrando si hace falta)."""
+        with open(path, "rb") as f:
+            head = f.read(len(_MAGIC))
+            if head != _MAGIC:
+                if head:
+                    yield head
+                for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+                    yield chunk
+                return
+            if self._key is None:
+                raise CorruptBlockError(f"{path.name} está cifrado y este nodo no tiene la clave")
+            aead = AESGCM(self._key)
+            prefix = f.read(_PREFIX_LEN)
+            current = f.read(_CIPHER_CHUNK)
+            index = 0
+            while True:
+                following = f.read(_CIPHER_CHUNK)
+                last = not following
+                try:
+                    yield aead.decrypt(_nonce(prefix, index, last), current, _MAGIC)
+                except InvalidTag as exc:
+                    raise CorruptBlockError(f"{path.name} no se puede descifrar (alterado o truncado)") from exc
+                if last:
+                    return
+                current = following
+                index += 1
+
     def open_verified(self, block_id: str) -> tuple[Path, int, str]:
         """Localiza un bloque y verifica su integridad. Devuelve
-        (ruta, tamaño, checksum). Lanza BlockNotFoundError o
+        (ruta, tamaño en claro, checksum). Lanza BlockNotFoundError o
         CorruptBlockError."""
         path = self._locate(block_id)
-        actual = sha256_of(path)
+        actual = self._hash(path)
         checksum_path = self._checksum_path(path)
         if checksum_path.exists():
             stored = checksum_path.read_text().strip()
@@ -210,16 +341,28 @@ class BlockStore:
                 raise CorruptBlockError(
                     f"el bloque {block_id} no coincide con su checksum (guardado={stored}, en disco={actual})"
                 )
-        return path, path.stat().st_size, actual
-
-    def iter_block(self, path: Path) -> Iterator[bytes]:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-                yield chunk
+        return path, self.plain_size(path), actual
 
     def get(self, block_id: str) -> bytes:
         path, _, _ = self.open_verified(block_id)
-        return path.read_bytes()
+        return b"".join(self.iter_block(path))
+
+    def inventory(self) -> list[dict]:
+        """Todos los bloques de este nodo: [{block_id, checksum, size_bytes}].
+        Usa el checksum guardado (no relee los bloques)."""
+        with self._lock:
+            items = list(self._index.items())
+        out = []
+        for block_id, file_id in items:
+            path = self._path_for(file_id, block_id)
+            if not path.exists():
+                continue
+            out.append({"block_id": block_id, "checksum": self._stored_checksum(path), "size_bytes": self.plain_size(path)})
+        return out
+
+    def file_id_of(self, block_id: str) -> str | None:
+        path = self._locate_or_none(block_id)
+        return path.parent.name if path else None
 
     # -- borrado -----------------------------------------------------------
     def delete(self, block_id: str) -> bool:
@@ -237,8 +380,7 @@ class BlockStore:
         existed = path.exists()
         path.unlink(missing_ok=True)
         self._checksum_path(path).unlink(missing_ok=True)
-        # Si la carpeta del archivo quedó vacía, la limpiamos (no es
-        # obligatorio, pero evita acumular directorios vacíos).
+        # Si la carpeta del archivo quedó vacía, la limpiamos.
         parent = path.parent
         try:
             if parent != self._root and parent.exists() and not any(parent.iterdir()):
@@ -261,15 +403,23 @@ class BlockStore:
         shutil.rmtree(file_dir, ignore_errors=True)
         return len(block_ids)
 
-    def _locate(self, block_id: str) -> Path:
-        validate_id(block_id, "block_id")
-        with self._lock:
-            file_id = self._index.get(block_id)
+    # -- búsqueda ------------------------------------------------------------
+    def _locate_unlocked(self, block_id: str) -> Path | None:
+        file_id = self._index.get(block_id)
         if file_id is not None:
             path = self._path_for(file_id, block_id)
             if path.exists():
                 return path
-        path = self._scan_for(block_id)
+        return None
+
+    def _locate_or_none(self, block_id: str) -> Path | None:
+        validate_id(block_id, "block_id")
+        with self._lock:
+            path = self._locate_unlocked(block_id)
+        return path or self._scan_for(block_id)
+
+    def _locate(self, block_id: str) -> Path:
+        path = self._locate_or_none(block_id)
         if path is None:
             raise BlockNotFoundError(block_id)
         return path

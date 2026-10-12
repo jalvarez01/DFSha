@@ -1,6 +1,6 @@
 # dfsha-cli
 
-Cliente CLI de DFSha (Hitos 1 y 2). Implementa la parte de **Mariana**:
+Cliente CLI de DFSha (Hitos 1, 2 y 3). Implementa la parte de **Mariana**:
 gestión del filesystem y transferencia desde el lado del cliente, más
 autenticación/sesión local. Desde el Hito 2, `put` y `get` hablan con dos
 tipos de nodo: el ControlNode para los metadatos y los DataNodes para los
@@ -20,8 +20,9 @@ pip install -e .        # habilita el comando `dfsha` en el PATH
 ## Uso
 
 ```bash
-# Por defecto apunta a http://localhost:8000; usar --base-url para otro server
-dfsha login mariana
+# Clúster del Hito 3 (dos ControlNodes con TLS); con un solo servidor sin
+# TLS basta `dfsha login mariana` (http://localhost:8000 por defecto)
+dfsha login mariana -u https://localhost:8000,https://localhost:8010 --ca-cert certs/ca.crt
 dfsha whoami
 dfsha pwd
 
@@ -41,12 +42,25 @@ dfsha cd ..
 dfsha rmdir docs
 dfsha rmdir -r docs                   # con su contenido
 
+# Hito 3
+dfsha status                          # líder, DataNodes, réplicas, bloques sub-replicados
+dfsha chmod 750 /docs                 # permisos (octal)
+dfsha group create equipo && dfsha group add equipo ana
+dfsha chgrp equipo /docs              # grupo dueño
+dfsha acl set user:ana:r-x /docs      # ACL; también `acl get` y `acl rm user:ana`
+dfsha lock /docs/informe.pdf          # lock exclusivo (o --shared); devuelve un id
+dfsha put --lock <id> informe.pdf /docs/informe.pdf
+dfsha unlock /docs/informe.pdf <id>
+dfsha 2fa setup && dfsha 2fa enable <código>   # 2FA: el próximo login pide el código
+dfsha apikey create scripts           # API key; luego `dfsha login --api-key`
+
 dfsha logout
 ```
 
 Variables de entorno útiles:
 
-- `DFSHA_BASE_URL`: URL base por defecto del servidor (si no se usa `--base-url` en `login`).
+- `DFSHA_BASE_URL`: URL base por defecto del servidor, o varias separadas por comas (líder y respaldos).
+- `DFSHA_CA_CERT`: CA para verificar el TLS del clúster (`certs/ca.crt`).
 - `DFSHA_CONFIG_DIR`: dónde vive la sesión local (por defecto `~/.dfsha`). Útil para tests o para tener varias sesiones en paralelo.
 - `DFSHA_BLOCK_SIZE`: tamaño de bloque que pide `put` (por defecto, el del ControlNode: 8 MiB).
 - `DFSHA_PARALLEL_TRANSFERS`: cuántos bloques se suben o bajan a la vez (por defecto 4).
@@ -58,7 +72,10 @@ Variables de entorno útiles:
 | `login`, `logout`, `whoami`, `pwd` | ControlNode (`/auth`) | ✅ |
 | `ls`, `mkdir`, `rmdir`, `rm`, `stat`, `cd` | ControlNode (`/fs/*`) | ✅ |
 | `put`, `get`                  | ControlNode (`allocate`/`confirm`/`blocks`) + DataNodes (`/blocks/*`) | ✅ probado end-to-end contra `docker compose` |
-| `nodes`                       | ControlNode (`/datanodes`) | ✅ |
+| `nodes`, `status`             | ControlNode (`/datanodes`, `/cluster/status`) | ✅ |
+| `chmod`, `chgrp`, `acl`, `group` | ControlNode (`/fs/*`, `/groups`) | ✅ |
+| `lock`, `unlock`, `locks`     | ControlNode (`/files/*/lock`) | ✅ |
+| `2fa`, `apikey`, `login --api-key` | ControlNode (`/auth/*`) | ✅ |
 
 Si un endpoint no existiera en el servidor, la CLI muestra un mensaje
 explícito ("endpoint aún no implementado en el servidor") en vez de un
@@ -84,12 +101,20 @@ local.
   servidor es que el destino exista y sea un directorio, vía
   `GET /fs/stat`.
 - **`put`/`get` distribuidos** (`distributed.py`): `put` pide el plan a
-  `allocate`, sube cada bloque **en paralelo** directo a su DataNode y
-  cierra con `confirm`; `get` pide `blocks`, baja los bloques en paralelo
-  y escribe cada uno en su offset. El usuario no ve dónde cae cada bloque
-  (transparencia de localización); `put` solo informa el reparto.
-- **JWT propagado**: el mismo token del login va al ControlNode y a cada
-  DataNode, que lo valida con el secreto compartido.
+  `allocate`, sube cada bloque **en paralelo** al primer DataNode de su
+  cadena de réplica (que lo reenvía a los demás; si no responde, prueba el
+  siguiente) y cierra con `confirm`, reintentando mientras los DataNodes
+  informan. `get` pide `blocks` y baja cada bloque de la primera réplica que
+  funcione, escribiéndolo en su offset. El usuario no ve dónde cae cada
+  bloque (transparencia de localización); `put` solo informa el reparto.
+- **Tokens de bloque** (Hito 3): el ControlNode firma un token por bloque
+  tras comprobar los permisos; la CLI lo manda al DataNode. Al ControlNode
+  le manda el JWT o la API key de la sesión.
+- **Failover transparente** (Hito 3): con varios ControlNodes en la sesión,
+  cada petición va al líder; si no responde o contesta `503 not_leader`,
+  la CLI prueba el siguiente.
+- **Lease de escritura** (Hito 3): `allocate` devuelve un lease exclusivo
+  que la CLI renueva durante subidas largas y manda en `confirm`.
 - **Streaming**: nunca se carga el archivo ni un bloque completo en
   memoria; todo va en chunks de 64 KiB.
 - **Integridad por bloque**: `put` manda el SHA-256 de cada bloque en

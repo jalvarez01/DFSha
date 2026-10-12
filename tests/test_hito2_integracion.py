@@ -16,6 +16,7 @@ from app.routers import control as control_module
 from app.routers import datanodes as datanodes_module
 from app.routers import fs as fs_module
 from app.routers import transfer as transfer_module
+from tests.helpers import deletions_for, register, write_file
 
 
 @pytest.fixture()
@@ -38,26 +39,15 @@ def client(db, tmp_path, monkeypatch):
 
 
 def client_register(client):
-    client.post("/datanodes/register", json={"node_id": "dn-0", "host": "10.0.0.1", "port": 9000})
+    register(client, "dn-0")
 
 
 def _distributed_write(client, path, size):
-    plan = client.post(f"/files{path}/allocate", json={"size_bytes": size, "block_size": 10}).json()
-    client.post(
-        f"/files{path}/confirm",
-        json={
-            "blocks": [
-                {"block_id": b["block_id"], "checksum": "x", "size_bytes": b["size_bytes"]}
-                for b in plan["blocks"]
-            ]
-        },
-    )
-    return plan
+    return write_file(client, path, size)
 
 
 def _pending(client):
-    resp = client.post("/datanodes/heartbeat", json={"node_id": "dn-0"})
-    return set(resp.json()["delete_blocks"])
+    return deletions_for(client, "dn-0")
 
 
 def test_get_heredado_de_archivo_distribuido_es_409_y_no_500(client):

@@ -13,6 +13,13 @@ La referencia campo a campo de cada endpoint está en
 [`CONTRATOS.md`](../CONTRATOS.md); los modelos Pydantic, en
 `app/schemas.py`.
 
+> **Hito 3.** Lo que sigue describe el sistema tal como quedó en el Hito 2.
+> El [Hito 3](ESPECIFICACION_HITO3.md) lo extiende: replicación de bloques,
+> un segundo ControlNode con failover, TLS, cifrado en reposo y control de
+> acceso. El cambio de protocolo más visible es que el DataNode ya no valida
+> el JWT del usuario, sino un **token de bloque** que firma el ControlNode
+> tras comprobar los permisos (§3.2 del Hito 3).
+
 ---
 
 ## 1. Arquitectura

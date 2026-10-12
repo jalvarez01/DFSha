@@ -16,5 +16,5 @@ EXPOSE 9001
 # Escucha en el mismo puerto que se anuncia al ControlNode/cliente
 # (DFSHA_DATANODE_ADVERTISE_PORT), para que docker-compose solo tenga que
 # fijar esa variable por contenedor sin necesitar una segunda para "puerto
-# de escucha interno".
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${DFSHA_DATANODE_ADVERTISE_PORT}"]
+# de escucha interno". Con DFSHA_TLS_CERT/DFSHA_TLS_KEY sirve HTTPS.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${DFSHA_DATANODE_ADVERTISE_PORT} ${DFSHA_TLS_CERT:+--ssl-certfile $DFSHA_TLS_CERT --ssl-keyfile $DFSHA_TLS_KEY}"]

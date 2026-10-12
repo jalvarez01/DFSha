@@ -4,6 +4,8 @@ Sistema de archivos distribuido por bloques, estilo HDFS.
 **Hito 1**: versión monolítica cliente/servidor.
 **Hito 2**: ControlNode + N DataNodes, con los archivos particionados en
 bloques (ver [Hito 2](#hito-2--particionamiento-y-dfs-distribuido-por-bloques)).
+**Hito 3**: alta disponibilidad, replicación, consistencia y seguridad (ver
+[Hito 3](#hito-3--alta-disponibilidad-replicación-consistencia-y-seguridad)).
 
 Stack: Python 3.11, FastAPI, SQLite (SQLAlchemy), Pydantic.
 
@@ -18,56 +20,58 @@ La autenticación básica user/pass con JWT que pide el enunciado ya está:
 `POST /auth/login` verifica credenciales y emite un token que todo
 endpoint exige como `Authorization: Bearer <jwt>`.
 
-Queda fuera del Hito 1: la arquitectura distribuida (Hito 2) y la alta
-disponibilidad, replicación y seguridad avanzada (Hito 3). En particular,
-el **control de acceso por usuario** es del Hito 3: hoy el token dice
-quién hace cada operación y quién es el dueño de cada archivo, pero el
-namespace sigue siendo global y no restringe nada.
+Quedaban fuera del Hito 1 la arquitectura distribuida (Hito 2) y la alta
+disponibilidad, replicación y seguridad avanzada (Hito 3), incluido el
+control de acceso por usuario. Ambos están implementados más abajo.
 
 ## Estructura del repo
 
 ```
 DFSha/
-├── app/
-│   ├── main.py            # App FastAPI, /health, arranque, routers
+├── app/                   # ControlNode
+│   ├── main.py            # App FastAPI, /health, migraciones, bucles de HA y re-replicación
 │   ├── config.py          # Settings (env vars)
 │   ├── database.py        # engine, SessionLocal, get_db
-│   ├── models.py          # Modelos SQLAlchemy: User, Directory, File, DataNode, Block, PendingDeletion
-│   ├── placement.py       # Hito 2: liveness, partición y round-robin
-│   ├── block_gc.py        # Hito 2: cola de borrado de bloques (vía heartbeat)
-│   ├── security.py        # Hash de contraseñas y JWT
+│   ├── models.py          # Modelos SQLAlchemy (namespace, bloques, réplicas, locks, grupos, ACL, HA)
 │   ├── path_service.py    # Resolución/validación de rutas (núcleo)
 │   ├── schemas.py         # Contratos Pydantic de request/response
-│   ├── deps.py            # Dependencias compartidas (usuario actual)
+│   ├── deps.py            # Usuario actual (API key, JWT)
+│   ├── security.py        # Contraseñas, JWT, TOTP (2FA), API keys
+│   ├── acl.py             # Hito 3: permisos estilo Unix, grupos y ACL
+│   ├── locks.py           # Hito 3: locks de archivo y leases de escritura
+│   ├── cluster_auth.py    # Hito 3: tokens entre nodos y tokens de bloque
+│   ├── placement.py       # Liveness, partición y cadenas de réplica
+│   ├── replication.py     # Hito 3: re-replicación, sobrantes, conciliación
+│   ├── block_gc.py        # Cola de borrado de bloques (vía heartbeat)
+│   ├── ha/                # Hito 3: ControlNode líder/respaldo (log de cambios, failover)
 │   └── routers/
-│       ├── fs.py          # RF1: ls/mkdir/rmdir/rm/stat (Jacobo)
-│       ├── transfer.py    # RF2: PUT/GET/HEAD de archivos (Paulina, Hito 1)
-│       ├── datanodes.py   # Hito 2: register/heartbeat de DataNodes (Juan)
-│       └── control.py     # Hito 2: allocate/confirm/blocks (particionamiento, Juan)
-├── datanode/              # Hito 2: servicio DataNode, independiente del ControlNode (Jacobo)
+│       ├── auth.py        # login, 2FA, API keys
+│       ├── fs.py          # RF1: ls/mkdir/rmdir/rm/stat + chmod/chgrp/acl
+│       ├── groups.py      # Hito 3: grupos
+│       ├── transfer.py    # RF2 monolítico del Hito 1
+│       ├── datanodes.py   # register/heartbeat/informes de DataNodes
+│       ├── control.py     # allocate/confirm/blocks + locks
+│       └── cluster.py     # Hito 3: /cluster/status
+├── datanode/              # Servicio DataNode
 │   ├── app/
-│   │   ├── config.py      # DFSHA_DATANODE_ID, DFSHA_CONTROLNODE_URL, etc.
-│   │   ├── storage.py     # Storage local: archivo=directorio, bloque=archivo
-│   │   ├── registration.py # register/heartbeat + órdenes de borrado
-│   │   ├── security.py    # validación del JWT del cliente
-│   │   └── main.py        # PUT/GET/DELETE /blocks/{block_id}
-│   ├── tests/
-│   └── requirements.txt
-├── cli/                   # Cliente de línea de comandos (Mariana)
-│   └── dfsha_cli/distributed.py  # Hito 2: put/get por bloques en paralelo
+│   │   ├── config.py      # Variables DFSHA_DATANODE_*, ControlNodes, TLS, clave
+│   │   ├── storage.py     # archivo=directorio, bloque=archivo; AES-GCM; inmutables
+│   │   ├── registration.py # heartbeat a todos los ControlNodes, órdenes, inventario
+│   │   ├── cluster.py     # líder conocido, época, informes pendientes
+│   │   ├── security.py    # tokens de bloque y de nodo
+│   │   └── main.py        # PUT/GET/DELETE /blocks/{block_id}, cadena de réplica
+│   └── tests/
+├── cli/                   # Cliente de línea de comandos
+│   └── dfsha_cli/distributed.py  # put/get por bloques con réplicas y failover
 ├── docs/
-│   └── ESPECIFICACION_HITO2.md   # Protocolos, APIs y diagramas de los 4 flujos
+│   ├── ESPECIFICACION_HITO2.md   # Protocolos y diagramas del Hito 2
+│   └── ESPECIFICACION_HITO3.md   # HA, replicación, consistencia, seguridad; los 5 pares de comunicación
 ├── scripts/
-│   └── verify_hito2.py    # Verificación end-to-end contra un clúster levantado
-├── tests/
-│   ├── conftest.py
-│   ├── test_path_service.py
-│   ├── test_auth.py       # Tests de login/JWT
-│   ├── test_fs.py         # Tests de RF1
-│   ├── test_transfer.py   # Tests de RF2 (Hito 1, monolítico)
-│   ├── test_control.py    # Hito 2: placement, allocate/confirm/blocks, borrados
-│   └── test_hito2_integracion.py  # Hito 2: convivencia con el Hito 1, migración
-├── docker-compose.yml     # 1 ControlNode + 3 DataNodes
+│   ├── setup_cluster.py   # Hito 3: CA, certificados por nodo y secretos (.env)
+│   ├── verify_hito2.py    # Verificación del Hito 2
+│   └── verify_hito3.py    # Verificación del Hito 3 con caídas reales (docker compose)
+├── tests/                 # Tests del ControlNode
+├── docker-compose.yml     # 2 ControlNodes + 4 DataNodes, TLS
 ├── requirements.txt
 ├── CONTRATOS.md
 └── README.md
@@ -102,9 +106,10 @@ Decisiones de equipo (ver `CONTRATOS.md` para el detalle de cada endpoint):
   respuesta de su heartbeat y la acusa en el siguiente. El ControlNode
   nunca llama a los DataNodes, y un nodo caído recibe sus órdenes al
   volver.
-- **Seguridad del DataNode**: exige el mismo JWT del login (secreto
-  compartido `DFSHA_JWT_SECRET`) y valida `file_id`/`block_id`, así que no
-  se puede escribir ni borrar fuera de su carpeta.
+- **Seguridad del DataNode**: valida `file_id`/`block_id`, así que no se
+  puede escribir ni borrar fuera de su carpeta. En el Hito 2 exigía el JWT
+  del login; desde el Hito 3 exige un token de bloque firmado por el
+  ControlNode.
 - **Integridad**: el cliente manda el SHA-256 de cada bloque
   (`X-Checksum-Sha256`); el DataNode rechaza lo que no coincide, guarda el
   checksum y verifica el bloque antes de servirlo, y el cliente lo verifica
@@ -114,33 +119,68 @@ La especificación de protocolos, con los diagramas de los cuatro flujos y
 el clúster en ejecución, está en
 [`docs/ESPECIFICACION_HITO2.md`](docs/ESPECIFICACION_HITO2.md).
 
-### Levantar el clúster y usarlo
+## Hito 3 — Alta disponibilidad, replicación, consistencia y seguridad
+
+Todo el detalle (diagramas de los cinco pares de comunicación, algoritmos,
+modelo de consistencia y límites) está en
+[`docs/ESPECIFICACION_HITO3.md`](docs/ESPECIFICACION_HITO3.md). Las firmas,
+en la sección "Hito 3" de [`CONTRATOS.md`](./CONTRATOS.md).
+
+**Alta disponibilidad y replicación (RNF2)**
+- Cada bloque se guarda en **3 DataNodes**. El cliente lo sube una sola vez
+  al primero de su cadena y cada DataNode lo reenvía al siguiente
+  (DataNode → DataNode).
+- Si un DataNode cae, el archivo se sigue leyendo desde otras réplicas, y
+  el ControlNode ordena copiar sus bloques a otro nodo hasta recuperar el
+  factor. Cuando el nodo vuelve, se quitan las réplicas sobrantes.
+- **Dos ControlNodes**: el líder replica cada cambio de metadatos al
+  respaldo (log de cambios capturado del ORM, replicación semi-síncrona). Si
+  el líder cae, el respaldo toma el control en unos 15 s, y la CLI cambia
+  sola de uno a otro. Para evitar dos líderes, el respaldo solo se promueve
+  si los DataNodes tampoco ven al líder; las épocas descartan órdenes de un
+  líder viejo.
+
+**Consistencia (RNF3)**
+- Un bloque solo se confirma si los DataNodes informan haberlo guardado con
+  ese checksum.
+- Los bloques son inmutables.
+- Una lectura nunca ve huecos ni pierde un bloque a mitad (hay un periodo de
+  gracia antes de borrar).
+- Locks y leases evitan que dos escritores se pisen (RF3 `lock()`).
+
+**Seguridad (RNF6)**
+- **TLS** en todas las conexiones, con una CA propia del clúster.
+- **Cifrado en reposo**: AES-256-GCM en cada DataNode.
+- **Control de acceso** estilo Unix: dueño, grupo, `rwx`, sticky bit,
+  **grupos** y **ACL**. Lo nuevo es privado por defecto.
+- **Autenticación**: user/password, **2FA (TOTP)**, **API keys** y bloqueo
+  por fuerza bruta.
+- **Entre nodos**: tokens firmados con un secreto de clúster. El DataNode
+  solo acepta **tokens de bloque** que firma el ControlNode tras comprobar
+  los permisos.
+
+### Levantar el clúster del Hito 3
 
 ```bash
-docker compose up --build -d          # 1 ControlNode (:8000) + 3 DataNodes (:8001-8003)
+pip install cryptography
+python scripts/setup_cluster.py       # CA + certificados por nodo (certs/) y secretos (.env); no van a git
+docker compose up --build -d          # cn1 (:8000, líder), cn2 (:8010, respaldo), 4 DataNodes (:8001-8004)
 
 pip install -e ./cli
-dfsha login mariana                   # -u http://localhost:8000 por defecto
-dfsha nodes                           # DataNodes y su estado
-dfsha put video.bin                   # se parte en bloques de 8 MiB
-dfsha get video.bin copia.bin         # baja en paralelo y verifica checksums
-DFSHA_BLOCK_SIZE=65536 dfsha put README.md   # bloques pequeños para la demo
+dfsha login ana -u https://localhost:8000,https://localhost:8010 --ca-cert certs/ca.crt
+dfsha put video.bin && dfsha status   # 3 réplicas por bloque
+dfsha chmod 640 /video.bin            # permisos; también chgrp, acl, group
+dfsha 2fa setup                       # 2FA; también apikey create
+dfsha lock /video.bin                 # lock exclusivo (RF3)
 
-python scripts/verify_hito2.py        # verificación end-to-end automática
-docker compose down                   # (-v para borrar también los datos)
+python scripts/verify_hito3.py        # ~1-3 min: replicación, seguridad, locks, caída de un DataNode y del líder
+docker compose stop controlnode-1     # o probarlo a mano: la CLI sigue funcionando con cn2
 ```
 
-Sin Docker, cada componente se puede levantar a mano:
-
-```bash
-uvicorn app.main:app --port 8000
-cd datanode && DFSHA_DATANODE_ID=dn1 DFSHA_DATANODE_ADVERTISE_PORT=9001 \
-  DFSHA_DATANODE_STORAGE_DIR=/tmp/dn1 uvicorn app.main:app --port 9001
-```
-
-`dfsha get` sigue pudiendo bajar archivos subidos con el `PUT` monolítico
-del Hito 1. Al arrancar, el ControlNode migra solo la tabla `blocks` de
-las BD de desarrollo creadas antes del reemplazo de bloques.
+**Al migrar bases existentes**: el ControlNode añade solo las columnas y
+tablas nuevas al arrancar. Lo que ya existía queda con permisos 0644/0755
+(legible por todos, escribible solo por su dueño), la raíz pasa a 1777 y
+cada bloque viejo queda con su única réplica.
 
 ## Cómo correrlo
 
@@ -153,19 +193,21 @@ uvicorn app.main:app --reload
 # -> http://localhost:8000/health
 ```
 
-En cualquier despliegue que no sea desarrollo local hay que fijar el
-secreto con el que se firman los JWT:
+En cualquier despliegue que no sea desarrollo local hay que fijar los
+secretos con los que se firman los JWT y los tokens entre nodos
+(`scripts/setup_cluster.py` los genera en `.env`):
 
 ```bash
 export DFSHA_JWT_SECRET="algo-largo-y-aleatorio"
+export DFSHA_CLUSTER_SECRET="otro-distinto"
 ```
 
 ## Tests
 
 ```bash
-pytest tests -q                                   # ControlNode (RF1, RF2, Hito 2)
-(cd datanode && pip install -r requirements.txt && pytest tests -q)   # DataNode
-pip install -e ./cli && pytest cli/tests -q       # CLI (incluye put/get distribuido)
+pytest tests -q                                   # ControlNode: RF1, RF2, Hitos 2 y 3 (ACL, 2FA, locks, réplicas, HA)
+(cd datanode && pip install -r requirements.txt && pytest tests -q)   # DataNode: tokens, cifrado, cadena, heartbeat
+pip install -e ./cli && pytest cli/tests -q       # CLI: put/get con réplicas y failover
 ```
 
 ## Autenticación (`app/routers/auth.py`, `app/security.py`)
@@ -180,8 +222,11 @@ como `Authorization: Bearer <token>`.
 - No hay endpoint de registro porque el enunciado solo pide autenticación
   básica: el primer login de un usuario sin contraseña fija la que envíe,
   y los siguientes la verifican (`401 invalid_credentials` si no cuadra).
-- El header `X-Username` se sigue aceptando como fallback de desarrollo
-  —no verifica nada—; si vienen los dos, gana el token.
+- El header `X-Username` (no verifica nada) solo se acepta con
+  `DFSHA_ALLOW_INSECURE_DEV_AUTH=true`, para tests y desarrollo: con control
+  de acceso permitiría suplantar a cualquiera.
+- Hito 3: 2FA (TOTP) opcional por usuario, API keys para scripts y bloqueo
+  temporal tras 5 logins fallidos. Ver la sección del Hito 3.
 
 ```bash
 # Obtener un token

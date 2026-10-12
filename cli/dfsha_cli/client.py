@@ -99,27 +99,53 @@ def _raise_for_status(resp: httpx.Response) -> None:
     )
 
 
+def _is_not_leader(resp: httpx.Response) -> bool:
+    if resp.status_code != 503:
+        return False
+    try:
+        detail = resp.json().get("detail")
+    except ValueError:
+        return False
+    return isinstance(detail, dict) and detail.get("error") == "not_leader"
+
+
 class DFShaClient:
     """Punto único de acceso HTTP a la API de DFSha. Todas las
     operaciones reciben rutas ya resueltas a absolutas por el llamador
-    (ver pathutils.resolve_path); este cliente no conoce el cwd."""
+    (ver pathutils.resolve_path); este cliente no conoce el cwd.
+
+    Alta disponibilidad: si la sesión tiene varios ControlNodes, cada
+    petición va al último que respondió como líder; si ese no responde o
+    contesta 503 `not_leader` (es un respaldo), prueba los demás. Así un
+    failover del ControlNode es transparente para el usuario."""
 
     def __init__(self, session: Session):
         self.session = session
-        self.base_url = session.base_url.rstrip("/")
+        self.base_urls = session.base_urls
+        self.base_url = self.base_urls[0]
+        self.verify = session.verify
         self._headers = build_auth_headers(session)
 
     # -- helpers internos ---------------------------------------------
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        url = f"{self.base_url}{path}"
         timeout = kwargs.pop("timeout", DEFAULT_TIMEOUT)
         headers = {**self._headers, **kwargs.pop("headers", {})}
-        try:
-            resp = httpx.request(method, url, headers=headers, timeout=timeout, **kwargs)
-        except httpx.HTTPError as exc:
-            raise ConnectionFailed(base_url=self.base_url, detail=str(exc)) from exc
-        _raise_for_status(resp)
-        return resp
+        candidates = [self.base_url] + [url for url in self.base_urls if url != self.base_url]
+        last_error = "ningún ControlNode respondió como líder"
+        for base in candidates:
+            try:
+                resp = httpx.request(
+                    method, f"{base}{path}", headers=headers, timeout=timeout, verify=self.verify, **kwargs
+                )
+            except httpx.HTTPError as exc:
+                last_error = str(exc)
+                continue
+            if _is_not_leader(resp):
+                continue
+            self.base_url = base
+            _raise_for_status(resp)
+            return resp
+        raise ConnectionFailed(base_url=", ".join(self.base_urls), detail=last_error)
 
     # -- RF1: gestión del filesystem (contrato /fs/*, Jacobo) ----------
     def ls(self, path: str) -> dict:
@@ -175,6 +201,7 @@ class DFShaClient:
                 content=_reader(),
                 headers=self._headers,
                 timeout=UPLOAD_DOWNLOAD_TIMEOUT,
+                verify=self.verify,
             )
         except httpx.HTTPError as exc:
             raise ConnectionFailed(base_url=self.base_url, detail=str(exc)) from exc
@@ -193,7 +220,7 @@ class DFShaClient:
         url = f"{self.base_url}/files{remote_path}"
         try:
             with httpx.stream(
-                "GET", url, headers=self._headers, timeout=UPLOAD_DOWNLOAD_TIMEOUT
+                "GET", url, headers=self._headers, timeout=UPLOAD_DOWNLOAD_TIMEOUT, verify=self.verify
             ) as resp:
                 if not resp.is_success:
                     resp.read()
@@ -220,18 +247,20 @@ class DFShaClient:
         """Headers de autenticación, para propagar el JWT a los DataNodes."""
         return dict(self._headers)
 
-    def allocate(self, path: str, size_bytes: int, block_size: int | None = None) -> dict:
-        """Fase 1 de la escritura: plan de qué bloque va a qué DataNode."""
+    def allocate(
+        self, path: str, size_bytes: int, block_size: int | None = None, lease_id: str | None = None
+    ) -> dict:
+        """Fase 1 de la escritura: plan de qué bloque va a qué DataNodes."""
         resp = self._request(
             "POST",
             f"/files{path}/allocate",
-            json={"size_bytes": size_bytes, "block_size": block_size},
+            json={"size_bytes": size_bytes, "block_size": block_size, "lease_id": lease_id},
         )
         return resp.json()
 
-    def confirm(self, path: str, blocks: list[dict]) -> dict:
+    def confirm(self, path: str, blocks: list[dict], lease_id: str | None = None) -> dict:
         """Fase 2 de la escritura: checksums y tamaños de lo subido."""
-        resp = self._request("POST", f"/files{path}/confirm", json={"blocks": blocks})
+        resp = self._request("POST", f"/files{path}/confirm", json={"blocks": blocks, "lease_id": lease_id})
         return resp.json()
 
     def blocks(self, path: str) -> dict:
@@ -242,6 +271,75 @@ class DFShaClient:
     def datanodes(self) -> list[dict]:
         resp = self._request("GET", "/datanodes")
         return resp.json()
+
+    def cluster_status(self) -> dict:
+        return self._request("GET", "/cluster/status").json()
+
+    # -- Hito 3: permisos y grupos -------------------------------------
+    def chmod(self, path: str, mode: str) -> dict:
+        return self._request("POST", "/fs/chmod", json={"path": path, "mode": mode}).json()
+
+    def chgrp(self, path: str, group: str | None) -> dict:
+        return self._request("POST", "/fs/chgrp", json={"path": path, "group": group}).json()
+
+    def get_acl(self, path: str) -> dict:
+        return self._request("GET", "/fs/acl", params={"path": path}).json()
+
+    def set_acl(self, path: str, kind: str, name: str, perms: str) -> dict:
+        return self._request("POST", "/fs/acl", json={"path": path, "type": kind, "name": name, "perms": perms}).json()
+
+    def remove_acl(self, path: str, kind: str, name: str) -> dict:
+        return self._request("DELETE", "/fs/acl", json={"path": path, "type": kind, "name": name}).json()
+
+    def create_group(self, name: str) -> dict:
+        return self._request("POST", "/groups", json={"name": name}).json()
+
+    def list_groups(self) -> list[dict]:
+        return self._request("GET", "/groups").json()
+
+    def add_group_member(self, group: str, username: str) -> dict:
+        return self._request("POST", f"/groups/{group}/members", json={"username": username}).json()
+
+    def remove_group_member(self, group: str, username: str) -> dict:
+        return self._request("DELETE", f"/groups/{group}/members/{username}").json()
+
+    def delete_group(self, group: str) -> None:
+        self._request("DELETE", f"/groups/{group}")
+
+    # -- Hito 3: locks -------------------------------------------------
+    def lock(self, path: str, mode: str = "exclusive", ttl_seconds: int | None = None) -> dict:
+        return self._request("POST", f"/files{path}/lock", json={"mode": mode, "ttl_seconds": ttl_seconds}).json()
+
+    def renew_lock(self, path: str, lock_id: str, ttl_seconds: int | None = None) -> dict:
+        return self._request("POST", f"/files{path}/lock/{lock_id}/renew", json={"ttl_seconds": ttl_seconds}).json()
+
+    def unlock(self, path: str, lock_id: str) -> dict:
+        return self._request("DELETE", f"/files{path}/lock/{lock_id}").json()
+
+    def locks(self, path: str) -> list[dict]:
+        return self._request("GET", f"/files{path}/locks").json()
+
+    # -- Hito 3: 2FA y API keys ----------------------------------------
+    def two_factor_status(self) -> dict:
+        return self._request("GET", "/auth/2fa").json()
+
+    def two_factor_setup(self) -> dict:
+        return self._request("POST", "/auth/2fa/setup").json()
+
+    def two_factor_enable(self, code: str) -> dict:
+        return self._request("POST", "/auth/2fa/enable", json={"code": code}).json()
+
+    def two_factor_disable(self, code: str) -> dict:
+        return self._request("POST", "/auth/2fa/disable", json={"code": code}).json()
+
+    def create_api_key(self, name: str, expires_in_days: int | None = None) -> dict:
+        return self._request("POST", "/auth/api-keys", json={"name": name, "expires_in_days": expires_in_days}).json()
+
+    def list_api_keys(self) -> list[dict]:
+        return self._request("GET", "/auth/api-keys").json()
+
+    def revoke_api_key(self, key_id: int) -> dict:
+        return self._request("DELETE", f"/auth/api-keys/{key_id}").json()
 
     def health(self) -> dict:
         resp = self._request("GET", "/health")

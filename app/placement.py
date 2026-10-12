@@ -17,6 +17,9 @@ Algoritmo de asignación (RNF4 — particionamiento):
    id: el bloque i va al nodo `live[(start + i) % n]`. `start` rota entre
    llamadas (un cursor global) para que archivos pequeños no caigan siempre
    en el mismo nodo y la carga quede balanceada.
+4. (Hito 3) Cada bloque se replica en `r = min(replication_factor, n)`
+   nodos distintos: los siguientes en el anillo, live[(start + i + k) % n]
+   para k = 0..r-1. El primero es el primario de la cadena de escritura.
 """
 from __future__ import annotations
 
@@ -110,34 +113,48 @@ def num_blocks(total_size: int, block_size: int) -> int:
 
 @dataclass
 class BlockAssignment:
-    """Resultado de planificar un bloque: su índice, tamaño y el DataNode
-    al que le toca."""
+    """Resultado de planificar un bloque: su índice, tamaño y la cadena de
+    DataNodes que lo van a guardar (el primero es al que sube el cliente)."""
 
     index: int
     size_bytes: int
-    datanode: DataNode
+    pipeline: list[DataNode]
+
+    @property
+    def datanode(self) -> DataNode:
+        return self.pipeline[0]
 
 
-def assign_one_node(live_nodes: list[DataNode]) -> DataNode:
-    """Elige un único DataNode vivo (mismo cursor round-robin que
-    plan_partition) para la escritura CRUD de un bloque puntual —
-    POST /files/{path}/blocks/{index}/allocate. A diferencia de
-    plan_partition, no depende del tamaño del bloque: sirve igual para
-    reemplazar un bloque existente (tamaño > 0) que para uno vacío
-    (tamaño 0, p. ej. al truncar).
+def effective_replication(live_count: int, requested: int | None = None) -> int:
+    """Réplicas por bloque: el factor configurado, sin pasar de los nodos
+    vivos (nunca dos réplicas del mismo bloque en el mismo nodo)."""
+    factor = max(1, requested or settings.replication_factor)
+    return max(1, min(factor, live_count))
+
+
+def _pipeline_at(live_nodes: list[DataNode], position: int, replication: int) -> list[DataNode]:
+    n = len(live_nodes)
+    return [live_nodes[(position + k) % n] for k in range(replication)]
+
+
+def assign_pipeline(live_nodes: list[DataNode], replication: int | None = None) -> list[DataNode]:
+    """Cadena de réplica para un bloque puntual (mismo cursor round-robin
+    que plan_partition). Sirve para el allocate CRUD de un solo bloque.
 
     Lanza NoLiveDataNodesError si no hay ningún nodo vivo.
     """
     if not live_nodes:
         raise NoLiveDataNodesError("No hay DataNodes vivos para asignar el bloque")
-    n = len(live_nodes)
-    start = _next_start(n)
-    return live_nodes[start]
+    r = effective_replication(len(live_nodes), replication)
+    return _pipeline_at(live_nodes, _next_start(len(live_nodes)), r)
 
 
-def plan_partition(total_size: int, block_size: int, live_nodes: list[DataNode]) -> list[BlockAssignment]:
-    """Parte un archivo de `total_size` en bloques de `block_size` y los
-    asigna round-robin sobre `live_nodes`.
+def plan_partition(
+    total_size: int, block_size: int, live_nodes: list[DataNode], replication: int | None = None
+) -> list[BlockAssignment]:
+    """Parte un archivo de `total_size` en bloques de `block_size` y asigna a
+    cada uno una cadena de `replication` nodos distintos, round-robin sobre
+    `live_nodes`: el bloque i va a live[start+i], live[start+i+1], ...
 
     Lanza NoLiveDataNodesError si hace falta al menos un bloque y no hay
     nodos vivos. Un archivo vacío devuelve una lista vacía sin exigir nodos.
@@ -149,12 +166,12 @@ def plan_partition(total_size: int, block_size: int, live_nodes: list[DataNode])
         raise NoLiveDataNodesError("No hay DataNodes vivos para asignar bloques")
 
     n = len(live_nodes)
+    r = effective_replication(n, replication)
     start = _next_start(n)
     assignments: list[BlockAssignment] = []
     remaining = total_size
     for i in range(count):
         size = min(block_size, remaining)
         remaining -= size
-        node = live_nodes[(start + i) % n]
-        assignments.append(BlockAssignment(index=i, size_bytes=size, datanode=node))
+        assignments.append(BlockAssignment(index=i, size_bytes=size, pipeline=_pipeline_at(live_nodes, start + i, r)))
     return assignments

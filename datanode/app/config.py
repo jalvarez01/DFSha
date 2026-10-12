@@ -16,35 +16,69 @@ class Settings(BaseSettings):
 
     # Identidad de este DataNode frente al ControlNode. Debe ser estable
     # entre reinicios (si cambia, el ControlNode lo trata como un nodo
-    # nuevo y los bloques que tenía asignados quedan "huérfanos").
+    # nuevo y los bloques que tenía asignados se dan por perdidos).
     datanode_id: str = "dn-local"
 
-    # Dónde vive el ControlNode (para register/heartbeat).
+    # ControlNodes (Hito 3: puede haber varios, líder y respaldos). Lista
+    # separada por comas; `controlnode_url` se mantiene por compatibilidad.
+    controlnode_urls: str = ""
     controlnode_url: str = "http://localhost:8000"
 
-    # host:puerto que el ControlNode debe anunciar a los CLIENTES para que
-    # le hablen directo a este DataNode (PUT/GET/DELETE /blocks/...). En
-    # docker-compose es el nombre del servicio (p. ej. "datanode-1") y el
-    # mismo puerto en el que este proceso escucha (ver Dockerfile: uvicorn
-    # se levanta con --port $DFSHA_DATANODE_ADVERTISE_PORT); en local,
-    # localhost.
+    # host:puerto que el ControlNode anuncia a los CLIENTES para que le
+    # hablen directo a este DataNode. En docker-compose es localhost y el
+    # puerto publicado; uvicorn escucha en ese mismo puerto (ver Dockerfile).
     datanode_advertise_host: str = "localhost"
     datanode_advertise_port: int = 9001
+    # host:puerto con el que lo alcanzan los OTROS DataNodes (cadena de
+    # escritura y re-replicación). En docker-compose, el nombre del servicio.
+    # Vacío = el mismo que el anunciado.
+    datanode_internal_host: str = ""
+    datanode_internal_port: int = 0
 
-    # Cada cuánto se manda heartbeat al ControlNode.
+    # Cada cuánto se manda heartbeat a los ControlNodes.
     heartbeat_interval: float = 10.0
+    # Cada cuánto se manda el inventario completo (block report).
+    block_report_interval: float = 600.0
 
     # Dónde guarda los bloques en disco: <storage_dir>/<file_id>/<block_id>
     # ("archivo como directorio, bloque como archivo" — decisión de equipo).
-    # Nombre de variable acordado en docker-compose.yml.
     datanode_storage_dir: Path = Path("/data/blocks")
 
-    # Validación del JWT que el cliente propaga desde el ControlNode
-    # (POST /auth/login). Debe ser el MISMO secreto que usa el ControlNode:
-    # en docker-compose ambos leen DFSHA_JWT_SECRET. El valor por defecto
-    # coincide con el del ControlNode y solo sirve para desarrollo.
-    jwt_secret: str = "dev-secret-cambiar-en-produccion"
-    jwt_algorithm: str = "HS256"
+    # Hito 3 — seguridad.
+    # Secreto del clúster: valida los tokens de bloque que firma el
+    # ControlNode y firma los tokens con los que este nodo se identifica.
+    cluster_secret: str = "dev-cluster-secret-cambiar-en-produccion"
+    # Clave AES-256 (base64, 32 bytes) para cifrar los bloques en disco.
+    # Vacía = sin cifrado en reposo (solo desarrollo).
+    datanode_storage_key: str = ""
+    # TLS: si hay certificado, este nodo sirve HTTPS (uvicorn lo carga con
+    # --ssl-certfile/--ssl-keyfile) y se anuncia con esquema https.
+    tls_cert: str = ""
+    tls_key: str = ""
+    # CA con la que se verifican los certificados de ControlNodes y otros
+    # DataNodes (vacío = verificación por defecto del sistema).
+    ca_cert: str = ""
+
+    @property
+    def controlnode_url_list(self) -> list[str]:
+        urls = [u.strip().rstrip("/") for u in self.controlnode_urls.split(",") if u.strip()]
+        return urls or [self.controlnode_url.rstrip("/")]
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.tls_cert else "http"
+
+    @property
+    def internal_host(self) -> str:
+        return self.datanode_internal_host or self.datanode_advertise_host
+
+    @property
+    def internal_port(self) -> int:
+        return self.datanode_internal_port or self.datanode_advertise_port
+
+    @property
+    def verify(self):
+        return self.ca_cert or True
 
 
 settings = Settings()

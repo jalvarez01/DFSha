@@ -4,6 +4,8 @@ Punto de entrada de la aplicación FastAPI.
 Este archivo SOLO se encarga de:
 - Crear las tablas (create_all), migrar las de versiones anteriores y
   sembrar el directorio raíz al arrancar.
+- Decidir el rol de HA (líder o respaldo) y arrancar los bucles de fondo:
+  seguimiento/failover entre ControlNodes y re-replicación de bloques.
 - Exponer /health.
 - Registrar los routers (ver abajo; el orden de /files importa).
 
@@ -13,18 +15,36 @@ aquí: cada compañero debe crear su propio `APIRouter` en un módulo nuevo
 `app.include_router(...)`, usando los modelos de app/schemas.py y las
 funciones de app/path_service.py.
 """
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, inspect, select, text
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
-from app.models import BLOCKS_UNIQUE_CONSTRAINT, Block, User
-from app.path_service import get_or_create_root
+from app.ha import changelog
+from app.ha import manager as ha_manager
+from app.ha.middleware import HAMiddleware
+from app.ha.state import state as ha_state
+from app.models import BLOCKS_UNIQUE_CONSTRAINT, Block, BlockReplica, User
+from app.path_service import ROOT_MODE, get_or_create_root
+from app.replication import PENDING, STORED, check_replication
 from app.schemas import ErrorResponse
+
+logger = logging.getLogger("dfsha")
+# Los mensajes de HA y re-replicación (loggers "dfsha.*") se ven en la
+# salida del servidor junto a los de uvicorn.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 def _migrate_blocks_table(bind: Engine) -> None:
@@ -56,16 +76,52 @@ def _migrate_blocks_table(bind: Engine) -> None:
         conn.execute(text("DROP TABLE blocks_old"))
 
 
-def _seed_root_directory() -> None:
-    """Crea las tablas si no existen y garantiza que exista:
-    - un usuario 'system' (dueño inicial de la raíz), y
-    - el directorio raíz ("/").
+def _add_missing_columns(bind: Engine) -> set[tuple[str, str]]:
+    """Añade a las tablas existentes las columnas nuevas de los modelos.
 
-    Se ejecuta una sola vez al arrancar el servidor.
+    `create_all` crea tablas nuevas pero no altera las que ya existen, así
+    que una BD de un hito anterior quedaría sin, p. ej., `files.mode`.
+    SQLite sí permite ADD COLUMN; las columnas NOT NULL nuevas traen un
+    `server_default` en el modelo para poder añadirse con filas existentes.
+    Devuelve las (tabla, columna) añadidas.
     """
+    inspector = inspect(bind)
+    existing_tables = set(inspector.get_table_names())
+    added: set[tuple[str, str]] = set()
+    with bind.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            present = {column["name"] for column in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present:
+                    continue
+                ddl = f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {column.type.compile(bind.dialect)}'
+                if column.server_default is not None:
+                    ddl += f" DEFAULT '{column.server_default.arg}'"
+                if not column.nullable and column.server_default is not None:
+                    ddl += " NOT NULL"
+                conn.execute(text(ddl))
+                added.add((table.name, column.name))
+    return added
+
+
+def prepare_database() -> set[tuple[str, str]]:
+    """Esquema al día (todos los nodos, líder o respaldo)."""
     Base.metadata.create_all(bind=engine)
     _migrate_blocks_table(engine)
+    return _add_missing_columns(engine)
 
+
+def seed_and_migrate_data(added_columns: set[tuple[str, str]] = frozenset()) -> None:
+    """Datos mínimos y migración de datos. Solo en el líder (en un respaldo
+    llegan por el log o el snapshot):
+
+    - Usuario 'system' (dueño de la raíz, no puede iniciar sesión) y raíz "/".
+    - Si la BD viene de antes del control de acceso: la raíz pasa a 1777.
+    - Bloques de antes de la replicación (sin filas en `block_replicas`):
+      su única copia es la de `blocks.datanode_id`.
+    """
     db = SessionLocal()
     try:
         system_user = db.scalar(select(User).where(User.username == "system"))
@@ -75,25 +131,81 @@ def _seed_root_directory() -> None:
             db.commit()
             db.refresh(system_user)
 
-        get_or_create_root(db, owner_id=system_user.id)
+        root = get_or_create_root(db, owner_id=system_user.id)
+        if ("directories", "mode") in added_columns and root.mode != ROOT_MODE:
+            root.mode = ROOT_MODE
+
+        orphans = db.scalars(select(Block).where(~Block.replicas.any())).all()
+        for block in orphans:
+            db.add(
+                BlockReplica(
+                    block_pk=block.id,
+                    datanode_id=block.datanode_id,
+                    state=STORED if block.committed else PENDING,
+                    checksum=block.checksum,
+                    size_bytes=block.size_bytes,
+                )
+            )
+        db.commit()
     finally:
         db.close()
 
 
+def _replication_pass() -> None:
+    db = SessionLocal()
+    try:
+        report = check_replication(db)
+        db.commit()
+        if report.scheduled or report.removed_excess or report.expired_tasks:
+            logger.info(
+                "Re-replicación: %d copias programadas, %d sobrantes quitadas, %d órdenes vencidas",
+                report.scheduled,
+                report.removed_excess,
+                report.expired_tasks,
+            )
+    finally:
+        db.close()
+
+
+async def _replication_loop(stop: asyncio.Event) -> None:
+    """Re-replicador (solo actúa en el líder)."""
+    while not stop.is_set():
+        try:
+            if ha_state.is_leader:
+                await run_in_threadpool(_replication_pass)
+        except Exception:  # noqa: BLE001 - el bucle no debe morir
+            logger.exception("Error en el re-replicador")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=settings.replication_check_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _seed_root_directory()
-    yield
-    # Nada que limpiar al apagar por ahora (SQLite no requiere pool teardown).
+    added = prepare_database()
+    changelog.install_hooks()
+    async with httpx.AsyncClient(verify=settings.ca_cert or True) as client:
+        await ha_manager.startup(client)
+    if ha_state.is_leader:
+        seed_and_migrate_data(added)
+
+    stop = asyncio.Event()
+    tasks = [asyncio.create_task(ha_manager.run(stop)), asyncio.create_task(_replication_loop(stop))]
+    try:
+        yield
+    finally:
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(
     title=settings.app_name,
     description=(
-        "ControlNode del DFS por bloques tipo HDFS — Hito 2: namespace, "
-        "placement de bloques y registro de DataNodes"
+        "ControlNode del DFS por bloques tipo HDFS — Hito 3: namespace, "
+        "placement y replicación de bloques, control de acceso y alta disponibilidad"
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -120,10 +232,18 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     )
 
 
+app.add_middleware(HAMiddleware)
+
+
 @app.get("/health", tags=["infra"])
 def health() -> dict[str, str]:
     """Endpoint de salud. Útil para healthchecks de Docker/orquestador."""
-    return {"status": "ok", "service": settings.app_name}
+    return {
+        "status": "ok",
+        "service": settings.app_name,
+        "controlnode_id": settings.controlnode_id,
+        "role": ha_state.role,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -137,14 +257,20 @@ def health() -> dict[str, str]:
 # resuelva al plan de lectura y no a "descargar el archivo /a/blocks".
 # Ver el docstring de app/routers/control.py.
 # ---------------------------------------------------------------------
-from app.routers.auth import router as auth_router
-from app.routers.control import router as control_router
-from app.routers.datanodes import router as datanodes_router
-from app.routers.fs import router as fs_router
-from app.routers.transfer import router as transfer_router
+from app.ha.router import router as ha_router  # noqa: E402
+from app.routers.auth import router as auth_router  # noqa: E402
+from app.routers.cluster import router as cluster_router  # noqa: E402
+from app.routers.control import router as control_router  # noqa: E402
+from app.routers.datanodes import router as datanodes_router  # noqa: E402
+from app.routers.fs import router as fs_router  # noqa: E402
+from app.routers.groups import router as groups_router  # noqa: E402
+from app.routers.transfer import router as transfer_router  # noqa: E402
 
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(fs_router, prefix="/fs", tags=["fs"])
+app.include_router(groups_router, prefix="/groups", tags=["groups"])
+app.include_router(cluster_router, prefix="/cluster", tags=["cluster"])
+app.include_router(ha_router, prefix="/ha", tags=["ha"])
 app.include_router(datanodes_router, prefix="/datanodes", tags=["datanodes"])
 app.include_router(control_router, prefix="/files", tags=["control"])
 app.include_router(transfer_router, prefix="/files", tags=["transfer"])

@@ -24,7 +24,14 @@ SESSION_FILE = CONFIG_DIR / "session.json"
 # Base URL por defecto del servidor DFSha. Puede sobreescribirse:
 # - con la variable de entorno DFSHA_BASE_URL, o
 # - con el flag --base-url en `dfsha login`.
+# Con alta disponibilidad (Hito 3) puede ser una LISTA separada por comas
+# (un ControlNode líder y sus respaldos): la CLI usa el que responda como
+# líder y cambia sola si hay un failover.
 DEFAULT_BASE_URL = os.getenv("DFSHA_BASE_URL", "http://localhost:8000")
+
+# CA con la que se verifican los certificados TLS del clúster (ControlNodes
+# y DataNodes). Vacío = verificación por defecto del sistema.
+DEFAULT_CA_CERT = os.getenv("DFSHA_CA_CERT", "")
 
 # Tamaño de chunk para lectura/escritura en streaming de archivos (mismo
 # criterio que el servidor, ver app/routers/transfer.py: CHUNK_SIZE).
