@@ -10,10 +10,11 @@ Ciclo (cada `heartbeat_interval` segundos):
    informes atrasados (bloques recibidos, bloques corruptos), el acuse de
    los borrados ya hechos y el informe de testigo (cuánto hace que habló
    con cada ControlNode).
-2. Líder = el que responde `role=leader` con la época más alta. Si un
+2. Líder = el que responde `role=leader` con la época más alta. El
+   DataNode se registra con cada líder nuevo, también al arrancar aunque el
+   líder ya lo conozca (así se actualiza su dirección si cambió). Si un
    ControlNode responde 404 `unknown_datanode`, es el líder y no conoce a
-   este nodo (primer arranque, o perdió su estado): se registra y le manda
-   el inventario completo.
+   este nodo (perdió su estado): se registra y le manda el inventario.
 3. Se ejecutan las órdenes del líder: `delete_blocks` (se acusan en el
    heartbeat siguiente; hasta entonces el líder las repite, así que una
    orden no se pierde si el nodo cae a mitad) y `replicate` (copiar un
@@ -69,6 +70,11 @@ async def register_loop(
     urls = settings.controlnode_url_list
     last_report = 0.0
     report_due = True
+    # Líder (controlnode_id) con el que este proceso ya se registró. Al
+    # arrancar es None: aunque el líder ya conozca a este DataNode, se vuelve
+    # a registrar para actualizar su dirección (p. ej. si cambió la IP que
+    # anuncia). Registrarse es idempotente.
+    registered_with: str | None = None
     async with httpx.AsyncClient(timeout=5.0, transport=transport, verify=settings.verify) as client:
         while not stop_event.is_set():
             try:
@@ -114,6 +120,11 @@ async def register_loop(
                             "Ignoro al líder %s: época %d < %d ya vista", data.get("controlnode_id"), data["epoch"], cluster.max_epoch
                         )
                     else:
+                        if data.get("controlnode_id") != registered_with:
+                            resp = await _post(client, url, "/datanodes/register", _register_body())
+                            if resp is not None and resp.status_code == 200:
+                                registered_with = data.get("controlnode_id")
+                                logger.info("Registrado en el ControlNode %s como %s", url, settings.datanode_id)
                         if data.get("controlnode_id") != cluster.leader_id:
                             logger.info("Líder: %s (época %d)", data.get("controlnode_id"), data["epoch"])
                             report_due = True

@@ -208,3 +208,14 @@ def test_se_re_registra_si_el_lider_no_lo_conoce(monkeypatch):
 
     run(Cluster(cn), monkeypatch, until=until)
     assert any(path == "/datanodes/register" for path, _ in cn.calls)
+
+
+def test_al_arrancar_se_registra_aunque_el_lider_ya_lo_conozca(monkeypatch):
+    """Si cambió la dirección anunciada (otra IP), el registro la actualiza."""
+    cn = FakeControlNode("cn1")
+    cn.known = True
+    run(Cluster(cn), monkeypatch, until=lambda: len(cn.heartbeats()) >= 6)
+    registers = [body for path, body in cn.calls if path == "/datanodes/register"]
+    # Una sola vez por líder, no en cada heartbeat.
+    assert len(registers) == 1
+    assert registers[0]["host"] == registration.settings.datanode_advertise_host
