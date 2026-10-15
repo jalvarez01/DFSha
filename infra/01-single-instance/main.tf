@@ -212,3 +212,15 @@ resource "aws_instance" "this" {
 
   tags = { Name = "dfsha-single-instance" }
 }
+
+# IP elástica: sin ella, la IP pública cambia en cada stop/start de la
+# instancia, lo que invalida los certificados (SAN) y la configuración
+# de DFSHA_DATANODE_ADVERTISE_HOST/DFSHA_PUBLIC_URL ya aplicada dentro de
+# ella. Con la EIP, se regenera certs/se parchea docker-compose.yml una
+# vez y queda estable mientras la instancia exista.
+resource "aws_eip" "instance" {
+  domain   = "vpc"
+  instance = aws_instance.this.id
+
+  tags = { Name = "dfsha-single-instance" }
+}

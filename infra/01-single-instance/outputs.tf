@@ -4,8 +4,8 @@ output "instance_id" {
 }
 
 output "public_ip" {
-  description = "IP pública de la instancia: host de ControlNode (cn1/cn2) y DataNodes para la CLI."
-  value       = aws_instance.this.public_ip
+  description = "IP elástica asociada a la instancia: host de ControlNode (cn1/cn2) y DataNodes para la CLI. Estable entre reinicios."
+  value       = aws_eip.instance.public_ip
 }
 
 output "secrets_bucket" {
@@ -20,5 +20,5 @@ output "ssm_session_command" {
 
 output "dfsha_login_command" {
   description = "Comando orientativo para la CLI una vez el clúster está arriba (requiere certs/ca.crt local)."
-  value       = "dfsha login <usuario> -u https://${aws_instance.this.public_ip}:8000,https://${aws_instance.this.public_ip}:8010 --ca-cert certs/ca.crt"
+  value       = "dfsha login <usuario> -u https://${aws_eip.instance.public_ip}:8000,https://${aws_eip.instance.public_ip}:8010 --ca-cert certs/ca.crt"
 }

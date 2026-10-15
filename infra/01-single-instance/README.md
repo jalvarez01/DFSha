@@ -71,7 +71,7 @@ IP=<public_ip>
 sed -i "s/DFSHA_DATANODE_ADVERTISE_HOST: \"[^\"]*\"/DFSHA_DATANODE_ADVERTISE_HOST: \"$IP\"/" docker-compose.yml
 sed -i -E "s#DFSHA_PUBLIC_URL: \"https://localhost:([0-9]+)\"#DFSHA_PUBLIC_URL: \"https://$IP:\1\"#" docker-compose.yml
 docker compose up --build -d
-docker compose ps   # deben verse 6 servicios Up/healthy
+docker compose ps   # 6 servicios Up; solo los 2 ControlNodes muestran (healthy) — los DataNodes no tienen healthcheck definido, es normal
 exit   # sale de la shell root
 exit   # cierra la sesión SSM
 ```
