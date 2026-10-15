@@ -21,3 +21,12 @@ certs/
 .vscode/
 .idea/
 .DS_Store
+
+# Terraform (infra/) — .terraform.lock.hcl SÍ se versiona (fija versiones de provider)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log

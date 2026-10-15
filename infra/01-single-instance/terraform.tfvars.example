@@ -1,0 +1,6 @@
+# Copia este archivo a terraform.tfvars (gitignored) y ajusta los valores.
+# allowed_cidr NO tiene default a propósito: hay que fijarlo a la IP
+# pública real del operador.
+
+allowed_cidr = ["203.0.113.4/32"] # sustituir por tu IP: curl https://checkip.amazonaws.com
+aws_region   = "us-east-1"
