@@ -34,7 +34,7 @@ variable "repo_url" {
 variable "git_ref" {
   description = "Rama, tag o commit de DFSha a clonar en la instancia."
   type        = string
-  default     = "dfee758"
+  default     = "c17af91"
 }
 
 variable "project_tag" {
