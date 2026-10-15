@@ -69,6 +69,7 @@ aws s3 cp "s3://<secrets_bucket>/cluster-bundle.tar.gz" .
 tar xzf cluster-bundle.tar.gz
 IP=<public_ip>
 sed -i "s/DFSHA_DATANODE_ADVERTISE_HOST: \"[^\"]*\"/DFSHA_DATANODE_ADVERTISE_HOST: \"$IP\"/" docker-compose.yml
+sed -i -E "s#DFSHA_PUBLIC_URL: \"https://localhost:([0-9]+)\"#DFSHA_PUBLIC_URL: \"https://$IP:\1\"#" docker-compose.yml
 docker compose up --build -d
 docker compose ps   # deben verse 6 servicios Up/healthy
 exit   # sale de la shell root
