@@ -17,6 +17,17 @@ Uso (requiere `pip install cryptography`):
     python scripts/setup_cluster.py            # no pisa lo que ya exista
     python scripts/setup_cluster.py --force    # regenera todo
 
+Si el cliente se conecta por una IP u hostname que no sea el nombre del
+servicio, `localhost` o 127.0.0.1 (p. ej. la IP pública de una instancia
+en la nube), hay que añadirlo al SAN de cada nodo con `--extra-san`:
+
+    python scripts/setup_cluster.py --force --extra-san 203.0.113.10
+
+`--extra-san` acepta varios valores (IPs y/o nombres DNS) y se añade al
+certificado de **todos** los nodos, no solo al de los ControlNodes: el
+cliente habla directo con cada DataNode, así que también necesita
+verificar su certificado contra esa dirección.
+
 La CLI verifica el TLS del clúster con certs/ca.crt:
 
     dfsha login ana -u https://localhost:8000,https://localhost:8010 --ca-cert certs/ca.crt
@@ -65,6 +76,14 @@ def _write_cert(cert, path: Path) -> None:
     path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
+def _parse_san(value: str):
+    """IP o nombre DNS para --extra-san, segun el formato de `value`."""
+    try:
+        return x509.IPAddress(ipaddress.ip_address(value))
+    except ValueError:
+        return x509.DNSName(value)
+
+
 def make_ca():
     key = _key()
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "DFSha Cluster CA")])
@@ -86,21 +105,25 @@ def make_ca():
             ),
             critical=True,
         )
+        # Sin esta extension, OpenSSL 3.2+ rechaza la cadena completa con
+        # "Missing Authority Key Identifier" al verificar los certs de
+        # nodo (que la referencian via AuthorityKeyIdentifier mas abajo).
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .sign(key, hashes.SHA256())
     )
     return key, cert
 
 
-def make_node_cert(name: str, ca_key, ca_cert):
+def make_node_cert(name: str, ca_key, ca_cert, extra_sans: list[str] | None = None):
     key = _key()
     now = datetime.now(timezone.utc)
-    san = x509.SubjectAlternativeName(
-        [
-            x509.DNSName(name),
-            x509.DNSName("localhost"),
-            x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-        ]
-    )
+    san_entries = [
+        x509.DNSName(name),
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ]
+    san_entries.extend(_parse_san(value) for value in extra_sans or [])
+    san = x509.SubjectAlternativeName(san_entries)
     cert = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
@@ -112,12 +135,17 @@ def make_node_cert(name: str, ca_key, ca_cert):
         .add_extension(san, critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .sign(ca_key, hashes.SHA256())
     )
     return key, cert
 
 
-def write_certs(force: bool) -> None:
+def write_certs(force: bool, extra_sans: list[str] | None = None) -> None:
     CERTS.mkdir(exist_ok=True)
     if (CERTS / "ca.crt").exists() and not force:
         print(f"· {CERTS.relative_to(ROOT)}/ ya existe (usa --force para regenerar)")
@@ -126,7 +154,7 @@ def write_certs(force: bool) -> None:
     _write_key(ca_key, CERTS / "ca.key")
     _write_cert(ca_cert, CERTS / "ca.crt")
     for name in NODES:
-        key, cert = make_node_cert(name, ca_key, ca_cert)
+        key, cert = make_node_cert(name, ca_key, ca_cert, extra_sans)
         _write_key(key, CERTS / f"{name}.key")
         _write_cert(cert, CERTS / f"{name}.crt")
         # El contenedor corre con otro usuario: la clave debe poder leerse
@@ -154,8 +182,16 @@ def write_env(force: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--force", action="store_true", help="Regenerar aunque ya existan")
+    parser.add_argument(
+        "--extra-san",
+        action="append",
+        default=[],
+        metavar="IP_O_HOST",
+        help="IP o nombre DNS adicional a incluir en el SAN de TODOS los certificados de nodo "
+        "(repetible: --extra-san A --extra-san B). Uso tipico: la IP publica de la instancia.",
+    )
     args = parser.parse_args()
-    write_certs(args.force)
+    write_certs(args.force, args.extra_san)
     write_env(args.force)
 
 

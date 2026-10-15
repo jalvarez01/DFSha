@@ -32,22 +32,29 @@ terraform plan
 terraform apply
 ```
 
-Guarda la salida (`terraform output`): da el `instance_id`, la
-`public_ip`, el `secrets_bucket` y comandos ya armados.
+Corre `terraform output` y anota estos cuatro valores — los vas a
+necesitar, ya literales, en el resto de esta guía:
+
+| Placeholder | De dónde sale |
+|---|---|
+| `<instance_id>` | output `instance_id` |
+| `<public_ip>` | output `public_ip` |
+| `<secrets_bucket>` | output `secrets_bucket` |
+| `<aws_region>` | el valor de `aws_region` que usaste en `terraform.tfvars` (por defecto `us-east-1`) |
 
 ## 2. Subir el material de `setup_cluster.py` (nunca a través de Terraform)
 
 ```bash
 cd ../..   # raíz del repo
 tar czf cluster-bundle.tar.gz certs .env
-aws s3 cp cluster-bundle.tar.gz "s3://$(terraform -chdir=infra/01-single-instance output -raw secrets_bucket)/cluster-bundle.tar.gz"
+aws s3 cp cluster-bundle.tar.gz "s3://<secrets_bucket>/cluster-bundle.tar.gz"
 rm cluster-bundle.tar.gz   # no dejar la copia sin cifrar en el disco local más de lo necesario
 ```
 
 ## 3. Abrir sesión administrativa y levantar el clúster
 
 ```bash
-eval "$(terraform -chdir=infra/01-single-instance output -raw ssm_session_command)"
+aws ssm start-session --target <instance_id> --region <aws_region>
 ```
 
 Dentro de la sesión SSM (en la instancia). La sesión entra como
@@ -60,6 +67,8 @@ sudo -s
 cd /opt/dfsha
 aws s3 cp "s3://<secrets_bucket>/cluster-bundle.tar.gz" .
 tar xzf cluster-bundle.tar.gz
+IP=<public_ip>
+sed -i "s/DFSHA_DATANODE_ADVERTISE_HOST: \"[^\"]*\"/DFSHA_DATANODE_ADVERTISE_HOST: \"$IP\"/" docker-compose.yml
 docker compose up --build -d
 docker compose ps   # deben verse 6 servicios Up/healthy
 exit   # sale de la shell root
@@ -70,7 +79,7 @@ exit   # cierra la sesión SSM
 
 ```bash
 pip install -e ./cli
-eval "$(terraform -chdir=infra/01-single-instance output -raw dfsha_login_command | sed 's/<usuario>/tu_usuario/')"
+dfsha login <usuario> -u https://<public_ip>:8000,https://<public_ip>:8010 --ca-cert certs/ca.crt
 dfsha nodes
 dfsha put algun_archivo.bin && dfsha get algun_archivo.bin copia.bin
 ```
@@ -85,7 +94,7 @@ pendiente (`[VALIDAR]`, tarea T6.4) en el tablero de tareas.
 
 ```bash
 # Solo cuando ya no necesites el bundle de secretos:
-aws s3 rm "s3://$(terraform -chdir=infra/01-single-instance output -raw secrets_bucket)/cluster-bundle.tar.gz"
+aws s3 rm "s3://<secrets_bucket>/cluster-bundle.tar.gz"
 
 terraform destroy
 ```
